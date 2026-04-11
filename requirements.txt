@@ -1,0 +1,5 @@
+torch>=2.0
+transformers>=4.40
+numpy>=1.26
+z3-solver>=4.12
+tqdm>=4.60

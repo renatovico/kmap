@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=75.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kllm"
+version = "0.1.0"
+description = "Lossless Bit-Sliced Logic Engine for LLM inference"
+readme = "README.md"
+requires-python = ">=3.13"
+license = "AGPL-3.0-or-later"
+authors = [
+    {name = "Renato Augusto Viço Elias", email = "renato@s2n.es"},
+]
+dependencies = [
+    "torch>=2.0",
+    "transformers>=4.40",
+    "numpy>=1.26",
+    "z3-solver>=4.12",
+    "tqdm>=4.60",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.9",
+]
+gpu = [
+    "cupy-cuda12x>=13.0",
+]
+
+[project.scripts]
+kllm = "kllm.cli:main"
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

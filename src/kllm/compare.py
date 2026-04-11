@@ -4,7 +4,9 @@ Runs the same input through:
   1. Traditional FP32 matrix multiplication (PyTorch)
   2. Lossless bit-sliced logic fabric (kllm)
 
-and prints a side-by-side report of timing, memory, and output stats.
+Each layer applies its projections independently to the original
+embeddings.  The results are accumulated so we get a fair timing
+comparison without shape mismatches between layers.
 """
 
 import os
@@ -20,33 +22,72 @@ from kllm.compiler import _PROJ_NAMES
 from kllm.device import free_vram, to_device, to_numpy, xp
 
 
-def _classic_forward_layer(embeddings: np.ndarray, layer) -> np.ndarray:
-    """Run one transformer layer's attention projections the traditional way."""
+def _classic_forward_all(
+    embeddings: np.ndarray,
+    layers,
+    num_layers: int,
+) -> np.ndarray:
+    """Run *num_layers* of attention projections the traditional (FP32) way.
+
+    Each layer applies q/k/v/o projections to the original *embeddings*
+    and the per-layer outputs are summed (element-wise) for a single
+    comparable result tensor.
+    """
     x = torch.from_numpy(embeddings)
-    results = []
-    for proj_name in _PROJ_NAMES:
-        proj = getattr(layer.self_attn, proj_name, None)
-        if proj is None:
-            continue
-        with torch.no_grad():
-            results.append(proj(x).numpy())
-    # Sum projections to produce a single comparable output per layer.
-    return sum(results)
+    accumulated = torch.zeros_like(x)
+
+    for li in range(num_layers):
+        layer = layers[li]
+        for proj_name in _PROJ_NAMES:
+            proj = getattr(layer.self_attn, proj_name, None)
+            if proj is None:
+                continue
+            with torch.no_grad():
+                out = proj(x)
+            # Projections may differ in width (GQA); pad/truncate to hidden_dim
+            # so we can accumulate into the same tensor.
+            if out.shape[-1] < accumulated.shape[-1]:
+                pad = torch.zeros(
+                    *out.shape[:-1],
+                    accumulated.shape[-1] - out.shape[-1],
+                )
+                out = torch.cat([out, pad], dim=-1)
+            elif out.shape[-1] > accumulated.shape[-1]:
+                out = out[..., : accumulated.shape[-1]]
+            accumulated += out
+
+    return accumulated.numpy()
 
 
 def _logic_forward_layer(planes: list, layer_data, proj_names: list) -> list:
-    """Run one layer through the bit-sliced logic fabric."""
-    accumulated = [xp.zeros_like(planes[p]) for p in range(4)]
+    """Run one layer through the bit-sliced logic fabric.
+
+    Performs the bit-level equivalent of a matrix multiply: for each
+    projection, apply gates element-wise across the input dimension and
+    XOR-reduce to produce a per-token scalar.
+    """
+    seq_len = planes[0].shape[0]
+    accumulated = [xp.zeros(seq_len, dtype=xp.uint8) for _ in range(4)]
+
     for proj_name in proj_names:
         prefix = f"{proj_name}_m"
         if f"{prefix}0_s1" not in layer_data:
             continue
         for p in range(4):
-            s1 = to_device(layer_data[f"{prefix}{p}_s1"])
-            mask = to_device(layer_data[f"{prefix}{p}_mask"])
-            result = (planes[p] << s1) ^ mask
-            accumulated[p] = accumulated[p] ^ result
+            s1 = to_device(layer_data[f"{prefix}{p}_s1"])     # (out_dim, in_dim)
+            mask = to_device(layer_data[f"{prefix}{p}_mask"])  # (out_dim, in_dim)
+            inp = planes[p]  # (seq_len, in_dim)
+
+            n_out = s1.shape[0]
+            token_result = xp.zeros(seq_len, dtype=xp.uint8)
+            for r in range(n_out):
+                gated = (inp << s1[r]) ^ mask[r]  # (seq_len, in_dim)
+                row_xor = xp.bitwise_xor.reduce(gated, axis=1)
+                token_result ^= row_xor
+
+            accumulated[p] ^= token_result
             del s1, mask
+
     free_vram()
     return accumulated
 
@@ -75,9 +116,7 @@ def compare(
     # ------------------------------------------------------------------ classic
     tracemalloc.start()
     t0 = time.perf_counter()
-    classic_state = embeddings.copy()
-    for li in range(num_layers):
-        classic_state = _classic_forward_layer(classic_state, model.model.layers[li])
+    classic_state = _classic_forward_all(embeddings, model.model.layers, num_layers)
     classic_time = time.perf_counter() - t0
     classic_mem_peak = tracemalloc.get_traced_memory()[1]
     tracemalloc.stop()
@@ -88,25 +127,36 @@ def compare(
 
     tracemalloc.start()
     t0 = time.perf_counter()
+    # Accumulate across all layers (each layer applied to original embeddings)
+    logic_accum = [xp.zeros(len(token_ids), dtype=xp.uint8) for _ in range(4)]
     for li in range(num_layers):
         data = np.load(os.path.join(save_dir, f"layer_{li}.npz"))
-        gpu_planes = _logic_forward_layer(gpu_planes, data, proj_names)
+        layer_result = _logic_forward_layer(gpu_planes, data, proj_names)
+        for p in range(4):
+            logic_accum[p] = logic_accum[p] ^ layer_result[p]
         del data
     logic_time = time.perf_counter() - t0
     logic_mem_peak = tracemalloc.get_traced_memory()[1]
     tracemalloc.stop()
 
-    # Reconstruct fp32 from planes for stats.
+    # Reconstruct fp32 from accumulated planes for stats.
     result_uint32 = (
-        gpu_planes[3].astype(xp.uint32) << 24
-        | gpu_planes[2].astype(xp.uint32) << 16
-        | gpu_planes[1].astype(xp.uint32) << 8
-        | gpu_planes[0].astype(xp.uint32)
+        logic_accum[3].astype(xp.uint32) << 24
+        | logic_accum[2].astype(xp.uint32) << 16
+        | logic_accum[1].astype(xp.uint32) << 8
+        | logic_accum[0].astype(xp.uint32)
     )
     logic_fp32 = to_numpy(
         result_uint32.view(xp.float32)
         if hasattr(result_uint32, "view")
         else result_uint32.view(np.float32)
+    )
+
+    # Fabric disk size
+    fabric_bytes = sum(
+        os.path.getsize(os.path.join(save_dir, f"layer_{i}.npz"))
+        for i in range(num_layers)
+        if os.path.exists(os.path.join(save_dir, f"layer_{i}.npz"))
     )
 
     del model
@@ -121,6 +171,7 @@ def compare(
         "speedup": classic_time / logic_time if logic_time > 0 else float("inf"),
         "classic_peak_mb": classic_mem_peak / 1024 / 1024,
         "logic_peak_mb": logic_mem_peak / 1024 / 1024,
+        "fabric_size_mb": fabric_bytes / 1024 / 1024,
         "classic_output_shape": classic_state.shape,
         "logic_output_shape": logic_fp32.shape,
         "classic_output_sample": classic_state.flat[:5].tolist(),
@@ -141,6 +192,7 @@ def print_report(stats: dict) -> None:
     print("-" * 60)
     print(f"  {'Time (s)':<28} {stats['classic_time_s']:>14.4f} {stats['logic_time_s']:>14.4f}")
     print(f"  {'Peak RAM (MB)':<28} {stats['classic_peak_mb']:>14.2f} {stats['logic_peak_mb']:>14.2f}")
+    print(f"  {'Fabric on disk (MB)':<28} {'—':>14} {stats['fabric_size_mb']:>14.2f}")
     print(f"  {'Output shape':<28} {str(stats['classic_output_shape']):>14} {str(stats['logic_output_shape']):>14}")
     print("-" * 60)
     print(f"  Speedup (logic / classic) : {stats['speedup']:.2f}x")

@@ -1,4 +1,4 @@
-from kllm.compare import _classic_forward_layer, _logic_forward_layer, print_report
+from kllm.compare import _classic_forward_all, _logic_forward_layer, print_report
 
 
 class TestPrintReport:
@@ -12,6 +12,7 @@ class TestPrintReport:
             "speedup": 2.18,
             "classic_peak_mb": 12.5,
             "logic_peak_mb": 3.2,
+            "fabric_size_mb": 38.5,
             "classic_output_shape": (1, 2048),
             "logic_output_shape": (1, 2048),
             "classic_output_sample": [0.1, 0.2, 0.3, 0.4, 0.5],

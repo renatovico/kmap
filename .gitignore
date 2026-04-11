@@ -26,3 +26,6 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# Compiled logic fabric (large, generated)
+lossless_logic/

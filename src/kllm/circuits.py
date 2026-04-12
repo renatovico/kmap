@@ -446,24 +446,29 @@ class ArithmeticUnit:
             }
         return self._hash_tables[name]
 
+
     def exec_unary_op(self, name: str, x: np.ndarray) -> np.ndarray:
         """Execute a compiled unary op via exact bit-pattern lookup.
 
-        If full-domain byte planes are loaded (mmap), uses direct O(1)
-        array indexing — every possible float32 value is covered.
-        Otherwise falls back to the traced hash-table path (tests).
+        If full-domain byte planes are loaded (mmap), deduplicates
+        input bit-patterns with ``np.unique`` (which also sorts them),
+        reads from the mmap in sorted order for page-cache locality,
+        then scatters results back via the inverse mapping.
 
         **No approximation, zero quantisation.**
         """
         flat = x.astype(np.float32).ravel()
 
-        # ---- Full-domain mmap path (production) ----
+        # ---- Full-domain mmap path (sorted direct read) ----
         if name in self._planes:
             idx = flat.view(np.uint32)
-            buf = np.empty((len(flat), 4), dtype=np.uint8)
+            unique_idx, inv = np.unique(idx, return_inverse=True)
+            planes = self._planes[name]
+            buf = np.empty((len(unique_idx), 4), dtype=np.uint8)
             for p in range(4):
-                buf[:, p] = self._planes[name][p][idx]
-            return buf.view(np.float32).reshape(x.shape)
+                buf[:, p] = planes[p][unique_idx]
+            out_u32 = buf.view(np.uint32).ravel()
+            return out_u32[inv].view(np.float32).reshape(x.shape)
 
         # ---- Hash-table path (traced domain, tests) ----
         op = self.ops[name]

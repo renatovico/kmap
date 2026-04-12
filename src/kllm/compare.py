@@ -23,26 +23,42 @@ def compare_generate(
 
     *text* is treated as a user message in a chat template.
     """
-    from transformers import pipeline as hf_pipeline
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    # ---- HuggingFace pipeline ----
+    # ---- HuggingFace (manual greedy decode) ----
+    # Use float32 + eager attention to match kllm's exact numerical
+    # path.  The pipeline API defaults to bfloat16 + SDPA which gives
+    # different accumulation results.
     messages = [{"role": "user", "content": text}]
-    pipe = hf_pipeline(
-        "text-generation", model=model_name,
-        max_new_tokens=max_tokens, do_sample=False,
+    hf_tok = AutoTokenizer.from_pretrained(model_name)
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        model_name, dtype=torch.float32,
+        attn_implementation="eager",
     )
 
+    prompt_text = hf_tok.apply_chat_template(
+        messages, add_generation_prompt=True, tokenize=False,
+    )
+    ids = hf_tok(prompt_text, return_tensors="pt")["input_ids"]
+
     t0 = time.perf_counter()
-    hf_result = pipe(messages)
+    gen_ids = ids.clone()
+    with torch.no_grad():
+        for _ in range(max_tokens):
+            logits = hf_model(gen_ids).logits[0, -1]
+            next_id = int(logits.argmax())
+            if next_id == hf_tok.eos_token_id:
+                break
+            gen_ids = torch.cat(
+                [gen_ids, torch.tensor([[next_id]])], dim=1,
+            )
     hf_time = time.perf_counter() - t0
 
-    hf_text = hf_result[0]["generated_text"]
-    if isinstance(hf_text, list):
-        hf_output = hf_text[-1]["content"]
-    else:
-        hf_output = hf_text
+    hf_output = hf_tok.decode(
+        gen_ids[0, ids.shape[1]:], skip_special_tokens=True,
+    )
 
-    del pipe
+    del hf_model
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     # ---- kllm engine (pure Python, no HuggingFace) ----

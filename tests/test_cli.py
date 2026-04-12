@@ -27,16 +27,6 @@ class TestCLIHelp:
 
 
 class TestCLIParser:
-    def test_engine_flag_accepted(self):
-        r = _run_cli("--mode", "inference", "--engine", "bitlogic", "--text", "hi",
-                      "--save-dir", "/nonexistent", check=False)
-        assert "unrecognized arguments" not in r.stderr
-
-    def test_engine_standard_accepted(self):
-        r = _run_cli("--mode", "inference", "--engine", "standard", "--text", "hi",
-                      "--save-dir", "/nonexistent", check=False)
-        assert "unrecognized arguments" not in r.stderr
-
     def test_max_tokens_flag(self):
         r = _run_cli("--mode", "generate", "--max-tokens", "10", "--text", "hi",
                       "--save-dir", "/nonexistent", check=False)

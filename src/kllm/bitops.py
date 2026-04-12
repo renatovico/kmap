@@ -44,10 +44,10 @@ def repack_sub_masks(
     -------
     np.ndarray (float32)
     """
-    packed = (
-        m3.astype(np.uint32) << 24
-        | m2.astype(np.uint32) << 16
-        | m1.astype(np.uint32) << 8
-        | m0.astype(np.uint32)
-    )
-    return packed.view(np.float32)
+    shape = m0.shape
+    buf = np.empty(shape + (4,), dtype=np.uint8)
+    buf[..., 0] = m0
+    buf[..., 1] = m1
+    buf[..., 2] = m2
+    buf[..., 3] = m3
+    return buf.view(np.float32).reshape(shape)

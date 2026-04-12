@@ -1,46 +1,45 @@
 # kllm
 
-Lossless Bit-Sliced Logic Engine for LLM inference.
+Z3 Gate Inference Engine for LLMs.
 
-Instead of running floating-point matrix multiplications at inference time,
-**kllm** decomposes every model weight into its raw IEEE-754 bit planes,
-uses a Z3 SMT solver to synthesise minimal boolean logic for each unique
-8-bit pattern, and streams the resulting "logic fabric" through the GPU
-using only bitwise operations (shift, XOR, AND).
+**kllm** decomposes every model weight into its raw IEEE-754 byte planes,
+uses a Z3 SMT solver to prove a minimal boolean gate `(0xFF << s1) ^ mask == target`
+for each byte value, and stores the gate parameters on disk. At inference time
+the gates are executed (shift + XOR) to recover the exact original weights —
+pure bit operations, zero precision loss.
 
 ## Key ideas
 
-| Concept | Traditional (FP32) | kllm (Bit-Sliced Logic) |
+| Concept | Traditional (FP32) | kllm (Z3 Gate Fabric) |
 |---|---|---|
-| Data unit | 32-bit float | 4 × 8-bit sub-masks |
-| Operation | Matrix multiply (FPU) | Boolean gates (XOR / shift) |
-| Weight storage | VRAM tensors | Pre-solved gate instructions |
+| Data unit | 32-bit float | 4 × `(s1, mask)` gate pairs |
+| Weight storage | VRAM tensors | Z3-proven gate instructions |
+| Recovery | N/A | `uint8(0xFF << s1) ^ mask` → byte plane |
 | Precision | Lossy if quantised | **Lossless** (raw IEEE-754) |
+| KV cache | Framework-managed | Built-in, O(1) per decode token |
 
-1. **Lossless sub-bit masking** — weights are viewed as raw `uint32` and
+1. **Lossless byte-plane decomposition** — weights are viewed as raw `uint32` and
    split into four 8-bit planes. No scaling, no rounding.
-2. **Z3 solver compilation** — each unique 8-bit pattern is reduced to
-   a minimal `(shift, mask)` gate pair. Patterns are deduplicated across
-   the entire model so the solver only runs once per unique value.
-3. **Layer streaming** — compiled layers are saved to disk as `.npz` files
-   and loaded one at a time during inference, keeping VRAM usage under 4 GB.
-4. **GPU / CPU transparent** — uses CuPy when a CUDA GPU is available,
-   falls back to NumPy automatically.
+2. **Z3 gate compilation** — the solver proves `(0xFF << s1) ^ mask == target`
+   for all 256 possible byte values. A lookup table maps each byte to its
+   `(s1, mask)` pair — no fallback, no failure.
+3. **One-time gate execution** — at load time, gates are executed (shift + XOR)
+   to recover float32 weights. The recovered weights are cached in RAM and the
+   raw gate arrays are discarded.
+4. **KV-cached generation** — prefill processes the full prompt, then each
+   decode step only forwards the new token through all layers.
 
 ## Installation
 
 ```bash
 pip install -e ".[dev]"
-
-# Optional: GPU acceleration
-pip install -e ".[gpu]"
 ```
 
 Requires Python ≥ 3.13.
 
 ## Usage
 
-### Compile a model into logic fabric (one-time)
+### Compile a model into gate fabric (one-time)
 
 ```bash
 kllm --mode compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
@@ -48,55 +47,58 @@ kllm --mode compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
 
 The compiled fabric is saved to `./lossless_logic/` by default.
 
-### Run inference with customer text
+### Run inference
 
 ```bash
 kllm --mode inference --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --text "Hello world"
-
-# Or interactively (prompts for input):
-kllm --mode inference --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
 ```
 
-### Compare classic FP32 vs bit-sliced logic
+### Generate text (KV-cached)
 
 ```bash
-kllm --mode compare --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --text "Hello world"
-
-# Limit layers for a quick test:
-kllm --mode compare --text "Hello" --max-layers 2
+kllm --mode generate --text "Who are you?" --max-tokens 50
 ```
 
-### Compile + inference in one shot
+### Compare with HuggingFace
 
 ```bash
-kllm --mode full --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --text "Hello world"
+kllm --mode compare --text "Who are you?" --max-tokens 10
+```
+
+### Compile + generate in one shot
+
+```bash
+kllm --mode full --text "Hello world"
 ```
 
 ### Options
 
 | Flag | Default | Description |
 |---|---|---|
-| `--mode` | *(required)* | `compile`, `inference`, `compare`, or `full` |
+| `--mode` | *(required)* | `compile`, `inference`, `generate`, `compare`, or `full` |
 | `--model` | `TinyLlama/TinyLlama-1.1B-Chat-v1.0` | HuggingFace model ID or local path |
 | `--save-dir` | `./lossless_logic` | Where compiled fabric is stored |
 | `--text` | *(interactive)* | Prompt text |
 | `--solver-timeout` | `200` | Z3 timeout per pattern in ms |
 | `--max-layers` | all | Limit layers (useful for quick tests) |
+| `--max-tokens` | `50` | Max new tokens for generate/compare modes |
 
 ## Project structure
 
 ```
 src/kllm/
-├── bitops.py      # Lossless IEEE-754 sub-bit mask extract / repack
-├── compiler.py    # Z3-based logic synthesis (compile mode)
-├── inference.py   # Streaming bit-sliced inference engine
-├── compare.py     # Side-by-side classic FP32 vs logic benchmark
+├── bitops.py      # Lossless IEEE-754 byte-plane extract / repack
+├── compiler.py    # Z3-based gate synthesis (compile mode)
+├── inference.py   # Z3 gate inference engine with KV cache
+├── compare.py     # HuggingFace vs kllm generation comparison
 ├── device.py      # GPU / CPU abstraction (CuPy ↔ NumPy)
 └── cli.py         # CLI entry point
 tests/
 ├── test_bitops.py
+├── test_cli.py
+├── test_compare.py
 ├── test_compiler.py
-└── test_compare.py
+└── test_device.py
 ```
 
 ## Running tests
@@ -110,29 +112,35 @@ pytest
 ```
               ┌─────────────┐
    FP32       │  .view(u32) │    4 × uint8 planes
-  weights ──▶ │  sub-bit    │──▶  m0  m1  m2  m3
-              │  masking    │
+  weights ──▶ │  byte-plane │──▶  m0  m1  m2  m3
+              │  decompose  │
               └─────────────┘
                     │
                     ▼
               ┌─────────────┐
-              │  Z3 solver  │    (shift, mask) per unique pattern
-              │  per unique │──▶  deduplicated across all layers
+              │  Z3 solver  │    (s1, mask) per byte value
+              │  per unique │──▶  uint8(0xFF << s1) ^ mask
               │  8-bit val  │
               └─────────────┘
                     │
                     ▼
               ┌─────────────┐
-              │  .npz layer │    streamed to GPU one at a time
-              │  fabric on  │──▶  (x << s1) ^ mask
+              │  .npz gate  │    stored on disk as layer files
+              │  fabric on  │──▶  s1[] + mask[] arrays
               │  disk       │
+              └─────────────┘
+                    │  (loaded once)
+                    ▼
+              ┌─────────────┐
+              │  execute &  │    gates → byte planes → np.view
+              │  cache      │──▶  float32 weights cached in RAM
+              │  float32    │
               └─────────────┘
                     │
                     ▼
               ┌─────────────┐
-              │  repack     │    lossless IEEE-754 floats out
-              │  uint32 →   │──▶  identical to FP32 pipeline
-              │  float32    │
+              │  KV-cached  │    prefill + O(1) decode per token
+              │  generation │──▶  identical output to HuggingFace
               └─────────────┘
 ```
 

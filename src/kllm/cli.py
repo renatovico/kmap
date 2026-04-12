@@ -6,6 +6,10 @@ Usage
   kllm --mode inference  --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
   kllm --mode compare    --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --text "Hello"
   kllm --mode full       --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
+
+  # PyTorch engine with KV-cache (no compiled fabric required)
+  kllm --mode inference --engine torch --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --text "Hello"
+  kllm --mode generate  --engine torch --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --device cuda --dtype bf16
 """
 
 import argparse
@@ -64,10 +68,29 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--engine",
-        choices=["standard", "bitlogic"],
+        choices=["standard", "bitlogic", "torch"],
         default="standard",
         help="standard: float matmul inference · "
-        "bitlogic: Z3 boolean gate (shift-XOR-reduce) inference",
+        "bitlogic: Z3 boolean gate (shift-XOR-reduce) inference · "
+        "torch: PyTorch engine with KV-cache (no compiled fabric needed)",
+    )
+    p.add_argument(
+        "--device",
+        type=str,
+        default="cpu",
+        help="Compute device for torch engine: cpu, cuda, cuda:0, … (default: cpu)",
+    )
+    p.add_argument(
+        "--dtype",
+        choices=["fp32", "bf16", "fp16"],
+        default="fp32",
+        help="Floating-point dtype for torch engine (default: fp32)",
+    )
+    p.add_argument(
+        "--window",
+        type=int,
+        default=131_072,
+        help="Sliding-window KV-cache size for torch engine (default: 131072 tokens)",
     )
     return p
 
@@ -92,7 +115,16 @@ def main(argv: list[str] | None = None) -> None:
         compiler.compile()
 
     if args.mode in ("inference", "full"):
-        if args.engine == "bitlogic":
+        if args.engine == "torch":
+            from kllm.torch_engine import TorchInferenceEngine
+
+            engine = TorchInferenceEngine(
+                model_name=args.model,
+                device=args.device,
+                dtype=args.dtype,
+                window=args.window,
+            )
+        elif args.engine == "bitlogic":
             from kllm.inference import BitLogicInferenceEngine
 
             engine = BitLogicInferenceEngine(
@@ -117,7 +149,16 @@ def main(argv: list[str] | None = None) -> None:
         print(f"Sample logits: {logits[0, :5].tolist()}")
 
     if args.mode == "generate":
-        if args.engine == "bitlogic":
+        if args.engine == "torch":
+            from kllm.torch_engine import TorchInferenceEngine
+
+            engine = TorchInferenceEngine(
+                model_name=args.model,
+                device=args.device,
+                dtype=args.dtype,
+                window=args.window,
+            )
+        elif args.engine == "bitlogic":
             from kllm.inference import BitLogicInferenceEngine
 
             engine = BitLogicInferenceEngine(

@@ -57,6 +57,40 @@ kllm --mode inference --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --text "Hello w
 kllm --mode inference --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
 ```
 
+### PyTorch engine — fast inference and generation with KV-cache
+
+The `torch` engine loads model weights directly from HuggingFace and uses
+PyTorch for compute. **No compiled fabric is required.** It supports
+GPU acceleration and implements a sliding-window KV-cache so generation
+stays fast even for very long outputs.
+
+```bash
+# CPU inference (fp32, default)
+kllm --mode inference --engine torch \
+     --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+     --text "Hello world"
+
+# GPU inference with bfloat16
+kllm --mode inference --engine torch \
+     --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+     --device cuda --dtype bf16 --text "Hello world"
+
+# Autoregressive generation with KV-cache (sliding window = 4096 tokens)
+kllm --mode generate --engine torch \
+     --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+     --device cuda --dtype bf16 \
+     --window 4096 --max-tokens 200 \
+     --text "Once upon a time"
+```
+
+#### Torch engine flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--device` | `cpu` | PyTorch device string: `cpu`, `cuda`, `cuda:0`, … |
+| `--dtype` | `fp32` | Floating-point format: `fp32`, `bf16`, `fp16` |
+| `--window` | `131072` | Sliding KV-cache window in tokens (larger = more context, more memory) |
+
 ### Compare classic FP32 vs bit-sliced logic
 
 ```bash
@@ -76,27 +110,36 @@ kllm --mode full --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --text "Hello world"
 
 | Flag | Default | Description |
 |---|---|---|
-| `--mode` | *(required)* | `compile`, `inference`, `compare`, or `full` |
+| `--mode` | *(required)* | `compile`, `inference`, `generate`, `compare`, or `full` |
 | `--model` | `TinyLlama/TinyLlama-1.1B-Chat-v1.0` | HuggingFace model ID or local path |
 | `--save-dir` | `./lossless_logic` | Where compiled fabric is stored |
 | `--text` | *(interactive)* | Prompt text |
+| `--engine` | `standard` | `standard`, `bitlogic`, or `torch` |
+| `--device` | `cpu` | PyTorch device (`torch` engine only) |
+| `--dtype` | `fp32` | Float dtype: `fp32`, `bf16`, `fp16` (`torch` engine only) |
+| `--window` | `131072` | KV-cache sliding window in tokens (`torch` engine only) |
 | `--solver-timeout` | `200` | Z3 timeout per pattern in ms |
 | `--max-layers` | all | Limit layers (useful for quick tests) |
+| `--max-tokens` | `50` | Max new tokens for generate mode |
 
 ## Project structure
 
 ```
 src/kllm/
-├── bitops.py      # Lossless IEEE-754 sub-bit mask extract / repack
-├── compiler.py    # Z3-based logic synthesis (compile mode)
-├── inference.py   # Streaming bit-sliced inference engine
-├── compare.py     # Side-by-side classic FP32 vs logic benchmark
-├── device.py      # GPU / CPU abstraction (CuPy ↔ NumPy)
-└── cli.py         # CLI entry point
+├── bitops.py       # Lossless IEEE-754 sub-bit mask extract / repack
+├── compiler.py     # Z3-based logic synthesis (compile mode)
+├── inference.py    # Streaming bit-sliced inference engine (NumPy)
+├── torch_engine.py # PyTorch engine with KV-cache and sliding window
+├── compare.py      # Side-by-side classic FP32 vs logic benchmark
+├── device.py       # GPU / CPU abstraction (CuPy ↔ NumPy)
+└── cli.py          # CLI entry point
 tests/
 ├── test_bitops.py
 ├── test_compiler.py
-└── test_compare.py
+├── test_compare.py
+├── test_device.py
+├── test_cli.py
+└── test_torch_engine.py
 ```
 
 ## Running tests

@@ -56,3 +56,28 @@ class TestCLIParser:
         r = _run_cli("--mode", "invalid", check=False)
         assert r.returncode != 0
         assert "invalid choice" in r.stderr
+
+    def test_engine_torch_accepted(self):
+        r = _run_cli("--mode", "inference", "--engine", "torch", "--text", "hi",
+                     check=False)
+        assert "unrecognized arguments" not in r.stderr
+
+    def test_device_flag_accepted(self):
+        r = _run_cli("--mode", "generate", "--engine", "torch", "--device", "cpu",
+                     "--text", "hi", check=False)
+        assert "unrecognized arguments" not in r.stderr
+
+    def test_dtype_flag_accepted(self):
+        r = _run_cli("--mode", "generate", "--engine", "torch", "--dtype", "bf16",
+                     "--text", "hi", check=False)
+        assert "unrecognized arguments" not in r.stderr
+
+    def test_window_flag_accepted(self):
+        r = _run_cli("--mode", "generate", "--engine", "torch", "--window", "4096",
+                     "--text", "hi", check=False)
+        assert "unrecognized arguments" not in r.stderr
+
+    def test_invalid_dtype_fails(self):
+        r = _run_cli("--mode", "generate", "--engine", "torch", "--dtype", "int8",
+                     "--text", "hi", check=False)
+        assert r.returncode != 0

@@ -535,15 +535,18 @@ class ArithmeticUnit:
 # ---------------------------------------------------------------
 
 def _silu_fn(x: np.ndarray) -> np.ndarray:
-    return (x / (1.0 + np.exp(-x.astype(np.float64)))).astype(np.float32)
+    with np.errstate(over="ignore", invalid="ignore"):
+        return (x / (1.0 + np.exp(-x.astype(np.float64)))).astype(np.float32)
 
 
 def _exp_fn(x: np.ndarray) -> np.ndarray:
-    return np.exp(x.astype(np.float64)).astype(np.float32)
+    with np.errstate(over="ignore"):
+        return np.exp(x.astype(np.float64)).astype(np.float32)
 
 
 def _rsqrt_fn(x: np.ndarray) -> np.ndarray:
-    return (1.0 / np.sqrt(x.astype(np.float64))).astype(np.float32)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return (1.0 / np.sqrt(x.astype(np.float64))).astype(np.float32)
 
 
 def compile_arithmetic_unit(

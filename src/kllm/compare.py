@@ -11,7 +11,6 @@ import os
 import time
 
 import torch
-from transformers import AutoTokenizer
 
 
 def compare_generate(
@@ -46,19 +45,18 @@ def compare_generate(
     del pipe
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
-    # ---- kllm engine ----
+    # ---- kllm engine (pure Python, no HuggingFace) ----
+    from kllm.tokenizer import Tokenizer as KllmTokenizer
+
     tok_dir = os.path.join(save_dir, "tokenizer")
-    if os.path.isdir(tok_dir):
-        tokenizer = AutoTokenizer.from_pretrained(tok_dir)
-    else:
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-    prompt = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True,
+    kllm_tok = KllmTokenizer(tok_dir)
+    prompt = kllm_tok.apply_chat_template(
+        messages, add_generation_prompt=True,
     )
 
     from kllm.inference import BitLogicInferenceEngine
 
-    eng = BitLogicInferenceEngine(model_name, save_dir)
+    eng = BitLogicInferenceEngine(save_dir)
 
     t0 = time.perf_counter()
     kllm_full = eng.generate(prompt, max_new_tokens=max_tokens)
@@ -66,8 +64,8 @@ def compare_generate(
 
     # generate() decodes with skip_special_tokens=True, so we must
     # compare against the prompt decoded the same way for correct slicing.
-    prompt_decoded = tokenizer.decode(
-        tokenizer.encode(prompt), skip_special_tokens=True,
+    prompt_decoded = kllm_tok.decode(
+        kllm_tok.encode(prompt), skip_special_tokens=True,
     )
     kllm_output = kllm_full[len(prompt_decoded):]
 

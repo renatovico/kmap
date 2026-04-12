@@ -84,24 +84,10 @@ def main(argv: list[str] | None = None) -> None:
         )
         compiler.compile()
 
-    if args.mode in ("inference", "full"):
+    if args.mode in ("inference", "generate", "full"):
         from kllm.inference import BitLogicInferenceEngine
 
         engine = BitLogicInferenceEngine(
-            model_name=args.model,
-            save_dir=args.save_dir,
-        )
-
-        text = _get_text(args)
-        output = engine.generate(text, max_new_tokens=args.max_tokens)
-        print(f"\n--- kllm Generated Text ---")
-        print(output)
-
-    if args.mode == "generate":
-        from kllm.inference import BitLogicInferenceEngine
-
-        engine = BitLogicInferenceEngine(
-            model_name=args.model,
             save_dir=args.save_dir,
         )
 

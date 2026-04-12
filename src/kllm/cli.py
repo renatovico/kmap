@@ -2,10 +2,12 @@
 
 Usage
 -----
-  kllm --mode compile   --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
-  kllm --mode inference  --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
-  kllm --mode compare    --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --text "Hello"
-  kllm --mode full       --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
+  kllm --mode compile          --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
+  kllm --mode compile-circuits
+  kllm --mode inference        --text "Hello"
+  kllm --mode stream           --text "Hello"
+  kllm --mode compare          --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --text "Hello"
+  kllm --mode full             --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
 """
 
 import argparse
@@ -18,13 +20,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--mode",
-        choices=["compile", "inference", "generate", "compare", "full"],
+        choices=[
+            "compile", "compile-circuits",
+            "inference", "generate", "stream",
+            "compare", "full",
+        ],
         required=True,
         help="compile: bake model into logic fabric · "
-        "inference: generate text from compiled fabric · "
-        "generate: auto-regressive text generation · "
-        "compare: HuggingFace vs kllm side-by-side · "
-        "full: compile then generate",
+        "compile-circuits: compile Z3 arithmetic circuits · "
+        "inference/generate: generate text · "
+        "stream: streaming token generation · "
+        "compare: HuggingFace vs kllm · "
+        "full: compile + compile-circuits + generate",
     )
     p.add_argument(
         "--model",
@@ -84,6 +91,12 @@ def main(argv: list[str] | None = None) -> None:
         )
         compiler.compile()
 
+    if args.mode in ("compile-circuits", "full"):
+        from kllm.ops_compiler import OpsCompiler
+
+        ops = OpsCompiler(save_dir=args.save_dir)
+        ops.compile()
+
     if args.mode in ("inference", "generate", "full"):
         from kllm.inference import BitLogicInferenceEngine
 
@@ -95,6 +108,20 @@ def main(argv: list[str] | None = None) -> None:
         output = engine.generate(text, max_new_tokens=args.max_tokens)
         print(f"\n--- kllm Generated Text ---")
         print(output)
+
+    if args.mode == "stream":
+        from kllm.inference import BitLogicInferenceEngine
+
+        engine = BitLogicInferenceEngine(
+            save_dir=args.save_dir,
+        )
+
+        text = _get_text(args)
+        print(f"\n--- kllm Streaming ---")
+        print(text, end="", flush=True)
+        for tok in engine.stream(text, max_new_tokens=args.max_tokens):
+            print(tok, end="", flush=True)
+        print()
 
     if args.mode == "compare":
         from kllm.compare import compare_generate, print_generate_report

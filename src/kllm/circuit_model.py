@@ -74,23 +74,23 @@ class CircuitMath:
     def silu(self, x: np.ndarray) -> np.ndarray:
         if self._fast:
             return self._np_silu(x)
-        if self._unit and "silu" in self._unit.ops:
-            return self._unit.exec_unary_op("silu", x)
-        return self._np_silu(x)
+        if self._unit is None:
+            raise RuntimeError("No Z3 circuits loaded — run compile-circuits")
+        return self._unit.exec_unary_op("silu", x)
 
     def exp(self, x: np.ndarray) -> np.ndarray:
         if self._fast:
             return self._np_exp(x)
-        if self._unit and "exp" in self._unit.ops:
-            return self._unit.exec_unary_op("exp", x)
-        return self._np_exp(x)
+        if self._unit is None:
+            raise RuntimeError("No Z3 circuits loaded — run compile-circuits")
+        return self._unit.exec_unary_op("exp", x)
 
     def rsqrt(self, x: np.ndarray) -> np.ndarray:
         if self._fast:
             return self._np_rsqrt(x)
-        if self._unit and "rsqrt" in self._unit.ops:
-            return self._unit.exec_unary_op("rsqrt", x)
-        return self._np_rsqrt(x)
+        if self._unit is None:
+            raise RuntimeError("No Z3 circuits loaded — run compile-circuits")
+        return self._unit.exec_unary_op("rsqrt", x)
 
     def rms_norm(
         self, x: np.ndarray, weight: np.ndarray, eps: float,

@@ -73,23 +73,73 @@ class Fabric:
         self.head_dim: int = self.hidden_size // self.num_heads
         self.num_groups: int = self.num_heads // self.num_kv_heads
 
-        # ---- Execute Z3 gates → float32 ----
+        # ---- Load weights: optimized cache or Z3 gates ----
         t0 = time.perf_counter()
 
+        cache_dir = os.path.join(save_dir, "optimized")
+        if os.path.isfile(os.path.join(cache_dir, "embed_tokens.npy")):
+            self._load_cached(cache_dir)
+            self._optimized = True
+        else:
+            self._load_z3_gates(save_dir)
+            self._optimized = False
+
+        self.load_time: float = time.perf_counter() - t0
+
+    def _load_cached(self, cache_dir: str) -> None:
+        """Load pre-materialized float32 weights (mmap, near-instant)."""
+        # embed_tokens needs fancy indexing (token lookup) — load into RAM.
+        self.embed_tokens = np.load(
+            os.path.join(cache_dir, "embed_tokens.npy"),
+        )
+        self.final_norm_weight = np.load(
+            os.path.join(cache_dir, "final_norm_weight.npy"),
+        )
+
+        lm_head_tied = bool(
+            np.load(os.path.join(cache_dir, "lm_head_tied.npy")),
+        )
+        if lm_head_tied:
+            self.lm_head = self.embed_tokens
+        else:
+            self.lm_head = np.load(
+                os.path.join(cache_dir, "lm_head.npy"), mmap_mode="r",
+            )
+
+        self.layers = []
+        for li in range(self.num_layers):
+            layer_dir = os.path.join(cache_dir, f"layer_{li}")
+            layer: dict[str, np.ndarray] = {}
+            for name in LINEAR_NAMES:
+                layer[name] = np.load(
+                    os.path.join(layer_dir, f"{name}.npy"), mmap_mode="r",
+                )
+            layer["input_layernorm_weight"] = np.load(
+                os.path.join(layer_dir, "input_layernorm_weight.npy"),
+                mmap_mode="r",
+            )
+            layer["post_attention_layernorm_weight"] = np.load(
+                os.path.join(layer_dir, "post_attention_layernorm_weight.npy"),
+                mmap_mode="r",
+            )
+            self.layers.append(layer)
+
+    def _load_z3_gates(self, save_dir: str) -> None:
+        """Original Z3 gate reconstruction (shift + XOR → float32)."""
         gdata = np.load(
             os.path.join(save_dir, "globals.npz"), allow_pickle=True,
         )
-        self.embed_tokens: np.ndarray = _z3_reconstruct_weight(tuple(
+        self.embed_tokens = _z3_reconstruct_weight(tuple(
             (np.array(gdata[f"embed_tokens_m{i}_s1"]),
              np.array(gdata[f"embed_tokens_m{i}_mask"]))
             for i in range(_NUM_PLANES)
         ))
-        self.final_norm_weight: np.ndarray = np.array(
+        self.final_norm_weight = np.array(
             gdata["final_norm_weight"],
         )
 
         if bool(gdata["lm_head_tied"]):
-            self.lm_head: np.ndarray = self.embed_tokens
+            self.lm_head = self.embed_tokens
         else:
             self.lm_head = _z3_reconstruct_weight(tuple(
                 (np.array(gdata[f"lm_head_m{i}_s1"]),
@@ -98,8 +148,7 @@ class Fabric:
             ))
         del gdata
 
-        # Per-layer weights
-        self.layers: list[dict[str, np.ndarray]] = []
+        self.layers = []
         for li in range(self.num_layers):
             path = os.path.join(save_dir, f"layer_{li}.npz")
             raw = np.load(path)
@@ -118,5 +167,3 @@ class Fabric:
                 raw["post_attention_layernorm_weight"],
             )
             self.layers.append(layer)
-
-        self.load_time: float = time.perf_counter() - t0

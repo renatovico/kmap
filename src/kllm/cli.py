@@ -21,13 +21,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--mode",
         choices=[
-            "compile", "compile-circuits",
+            "compile", "compile-circuits", "optimize-circuits",
             "inference", "generate", "stream",
             "compare", "full",
         ],
         required=True,
         help="compile: bake model into logic fabric · "
         "compile-circuits: compile Z3 arithmetic circuits · "
+        "optimize-circuits: Kmap/Espresso logic minimization · "
         "inference/generate: generate text · "
         "stream: streaming token generation · "
         "compare: HuggingFace vs kllm · "
@@ -97,6 +98,12 @@ def main(argv: list[str] | None = None) -> None:
         ops = OpsCompiler(save_dir=args.save_dir)
         ops.compile()
 
+    if args.mode == "optimize-circuits":
+        from kllm.optimizer import CircuitOptimizer
+
+        opt = CircuitOptimizer(save_dir=args.save_dir)
+        opt.optimize()
+
     if args.mode in ("inference", "generate", "full"):
         from kllm.inference import BitLogicInferenceEngine
 
@@ -105,7 +112,11 @@ def main(argv: list[str] | None = None) -> None:
         )
 
         text = _get_text(args)
-        output = engine.generate(text, max_new_tokens=args.max_tokens)
+        messages = [{"role": "user", "content": text}]
+        prompt = engine.tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True,
+        )
+        output = engine.generate(prompt, max_new_tokens=args.max_tokens)
         print(f"\n--- kllm Generated Text ---")
         print(output)
 
@@ -117,9 +128,12 @@ def main(argv: list[str] | None = None) -> None:
         )
 
         text = _get_text(args)
+        messages = [{"role": "user", "content": text}]
+        prompt = engine.tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True,
+        )
         print(f"\n--- kllm Streaming ---")
-        print(text, end="", flush=True)
-        for tok in engine.stream(text, max_new_tokens=args.max_tokens):
+        for tok in engine.stream(prompt, max_new_tokens=args.max_tokens):
             print(tok, end="", flush=True)
         print()
 

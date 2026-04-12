@@ -55,21 +55,29 @@ class BitLogicInferenceEngine:
         # ---- Fabric (Z3 gates → float32 weights) ----
         print("[*] Loading Z3 gate fabric …")
         self.fabric = Fabric(save_dir)
-        print(
-            f"[+] Weights reconstructed from Z3 gates in "
-            f"{self.fabric.load_time:.1f}s "
-            f"({self.fabric.num_layers} layers, 7 projections each)"
-        )
-
-        # ---- Arithmetic circuits (optional) ----
-        circuit_path = os.path.join(save_dir, "circuits.npz")
-        unit: ArithmeticUnit | None = None
-        if os.path.exists(circuit_path):
-            unit = ArithmeticUnit.load(circuit_path)
-            ops = list(unit.ops.keys())
-            print(f"[+] Z3 arithmetic circuits loaded: {', '.join(ops)}")
+        if self.fabric._optimized:
+            print(
+                f"[+] Weights loaded from optimized cache in "
+                f"{self.fabric.load_time:.1f}s "
+                f"({self.fabric.num_layers} layers, mmap)"
+            )
         else:
-            print("[*] No circuits.npz — activations use NumPy fallback")
+            print(
+                f"[+] Weights reconstructed from Z3 gates in "
+                f"{self.fabric.load_time:.1f}s "
+                f"({self.fabric.num_layers} layers, 7 projections each)"
+            )
+
+        # ---- Arithmetic circuits (required) ----
+        circuit_path = os.path.join(save_dir, "circuits.npz")
+        if not os.path.exists(circuit_path):
+            raise FileNotFoundError(
+                f"No Z3 arithmetic circuits at {circuit_path}. "
+                "Run `kllm --mode compile-circuits` first."
+            )
+        unit = ArithmeticUnit.load(circuit_path)
+        ops = list(unit.ops.keys())
+        print(f"[+] Z3 arithmetic circuits loaded: {', '.join(ops)}")
 
         # ---- Transformer (circuit-based, with generators) ----
         self.model = CircuitTransformer(self.fabric, unit)

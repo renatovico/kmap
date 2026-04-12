@@ -203,19 +203,25 @@ class TestArithmeticUnit:
 # ------------------------------------------------------------------
 
 class TestCircuitMath:
-    def test_fallback_silu(self):
-        """CircuitMath without a unit falls back to NumPy."""
+    def test_no_unit_raises(self):
+        """CircuitMath without a unit raises on activation calls."""
         from kllm.circuit_model import CircuitMath
         cm = CircuitMath(unit=None)
         x = np.array([0.0, 1.0, -1.0], dtype=np.float32)
-        result = cm.silu(x)
-        expected = _silu_fn(x)
-        np.testing.assert_allclose(result, expected, rtol=1e-5)
+        with pytest.raises(RuntimeError, match="No Z3 circuits"):
+            cm.silu(x)
 
-    def test_fallback_softmax(self):
+    def test_softmax_with_unit(self):
+        """CircuitMath softmax works with compiled circuits."""
         from kllm.circuit_model import CircuitMath
-        cm = CircuitMath(unit=None)
+        unit = ArithmeticUnit()
+        unit.compile_constant_gates()
+        # softmax computes (x - max(x)) then exp; ensure those values
+        # are in the compiled domain.
         x = np.array([[1.0, 2.0, 3.0]], dtype=np.float32)
+        softmax_inputs = (x - x.max(axis=-1, keepdims=True)).ravel()
+        unit.compile_unary_op("exp", _exp_fn, softmax_inputs)
+        cm = CircuitMath(unit=unit)
         result = cm.softmax(x)
         assert result.shape == (1, 3)
         np.testing.assert_allclose(result.sum(), 1.0, atol=1e-5)
@@ -253,10 +259,16 @@ class TestCircuitTransformerStreaming:
         if not has_fabric:
             pytest.skip("No compiled fabric")
 
+        from kllm.circuits import ArithmeticUnit as AU
         from kllm.circuit_model import CircuitTransformer
         from kllm.fabric import Fabric
         fabric = Fabric("./lossless_logic")
-        model = CircuitTransformer(fabric)
+        circuit_path = "./lossless_logic/circuits.npz"
+        import os
+        if not os.path.exists(circuit_path):
+            pytest.skip("No compiled circuits")
+        unit = AU.load(circuit_path)
+        model = CircuitTransformer(fabric, unit)
 
         stages = []
         for stage, li, data in model.forward_gen([1, 15043], start_pos=0):

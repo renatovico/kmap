@@ -1,4 +1,4 @@
-from kllm.compare import _classic_forward_all, _logic_forward_layer, print_report
+from kllm.compare import print_report
 
 
 class TestPrintReport:
@@ -8,18 +8,25 @@ class TestPrintReport:
             "tokens": 1,
             "layers": 2,
             "classic_time_s": 0.1234,
-            "logic_time_s": 0.0567,
+            "kllm_time_s": 0.0567,
             "speedup": 2.18,
             "classic_peak_mb": 12.5,
-            "logic_peak_mb": 3.2,
+            "kllm_peak_mb": 3.2,
+            "model_size_mb": 4200.0,
             "fabric_size_mb": 38.5,
-            "classic_output_shape": (1, 2048),
-            "logic_output_shape": (1, 2048),
-            "classic_output_sample": [0.1, 0.2, 0.3, 0.4, 0.5],
-            "logic_output_sample": [0.1, 0.2, 0.3, 0.4, 0.5],
+            "classic_output_shape": (4, 32000),
+            "kllm_output_shape": (4, 32000),
+            "classic_decoded": "Hello world example",
+            "kllm_decoded": "Hello world example",
+            "classic_sample": [0.1, 0.2, 0.3, 0.4, 0.5],
+            "kllm_sample": [0.1, 0.2, 0.3, 0.4, 0.5],
+            "max_abs_diff": 0.0,
+            "mean_abs_diff": 0.0,
+            "logits_match": True,
+            "tokens_match": True,
         }
         print_report(stats)
         captured = capsys.readouterr()
-        assert "Classic FP32 vs Lossless Bit-Sliced Logic" in captured.out
+        assert "HuggingFace vs Lossless Fabric" in captured.out
         assert "Hello" in captured.out
-        assert "Speedup" in captured.out
+        assert "Logits match" in captured.out

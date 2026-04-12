@@ -1,28 +1,24 @@
+import numpy as np
 import pytest
 
-from kllm.compiler import LosslessLogicCompiler
+from kllm.compiler import LosslessLogicCompiler, _store_weight_gates
 
 
 class TestSolvePattern:
-    def test_identity_zero(self):
-        """Pattern 0: (x & 0) == 0 for all x — should solve trivially."""
+    def test_target_zero(self):
+        """Z3 solves target=0: uint8(0xFF << s1) ^ mask == 0."""
         s1, mask = LosslessLogicCompiler._solve_pattern(0)
         assert isinstance(s1, int)
         assert isinstance(mask, int)
-        # The solver finds (s1, mask) such that for all x:
-        #   (x << s1) ^ mask == (x & target_val)
-        # For target 0, (x & 0) == 0 for all x.
-        # The fallback (0, 0) means (x << 0) ^ 0 == x, which != 0,
-        # so the solver may return a different pair. Either way the
-        # function must return a valid tuple.
-        assert 0 <= s1 <= 255
-        assert 0 <= mask <= 255
+        # Gate recovery must produce the target byte.
+        recovered = ((0xFF << s1) & 0xFF) ^ mask
+        assert recovered == 0
 
-    def test_identity_255(self):
-        """Pattern 255: (x & 0xFF) == x — identity."""
+    def test_target_255(self):
+        """Z3 solves target=255: uint8(0xFF << s1) ^ mask == 255."""
         s1, mask = LosslessLogicCompiler._solve_pattern(255)
-        assert isinstance(s1, int)
-        assert isinstance(mask, int)
+        recovered = ((0xFF << s1) & 0xFF) ^ mask
+        assert recovered == 255
 
     def test_returns_tuple_of_two_ints(self):
         for val in (0, 1, 42, 127, 200, 255):
@@ -30,15 +26,21 @@ class TestSolvePattern:
             assert len(result) == 2
             assert all(isinstance(v, int) for v in result)
 
-    def test_fallback_preserves_value(self):
-        """Even if Z3 can't find a shift trick, the fallback is (0, val)."""
-        # We can't force a timeout easily, but we can check the fallback path
-        # manually: (x << 0) ^ val == x ^ val, compared to x & val.
-        # The fallback is only used when Z3 fails, but it always returns a
-        # valid tuple.
-        s1, mask = LosslessLogicCompiler._solve_pattern(170)
-        assert 0 <= s1 <= 7 or s1 == 0
-        assert 0 <= mask <= 255
+    def test_gate_recovery_all_256(self):
+        """Z3 proves ALL 256 byte values — no fallback needed."""
+        for target in range(256):
+            s1, mask = LosslessLogicCompiler._solve_pattern(target)
+            recovered = ((0xFF << s1) & 0xFF) ^ mask
+            assert recovered == target, (
+                f"Gate recovery failed for target={target}: "
+                f"s1={s1}, mask={mask}, got={recovered}"
+            )
+
+    def test_shift_within_range(self):
+        """All solved shifts are in [0, 7]."""
+        for target in (0, 1, 42, 170, 254, 255):
+            s1, mask = LosslessLogicCompiler._solve_pattern(target)
+            assert 0 <= s1 <= 7
 
     def test_custom_timeout(self):
         """Solver accepts a custom timeout without error."""
@@ -71,3 +73,36 @@ class TestSolveUnique:
         for val, (s1, mask) in registry.items():
             assert isinstance(s1, int)
             assert isinstance(mask, int)
+
+
+class TestBuildGateLut:
+    def test_lut_shape_and_dtype(self):
+        compiler = LosslessLogicCompiler(model_name="dummy", save_dir="/tmp/kllm_test")
+        s1_lut, mask_lut = compiler._build_gate_lut()
+        assert s1_lut.shape == (256,)
+        assert mask_lut.shape == (256,)
+        assert s1_lut.dtype == np.uint8
+        assert mask_lut.dtype == np.uint8
+
+    def test_lut_shift_values_within_range(self):
+        compiler = LosslessLogicCompiler(model_name="dummy", save_dir="/tmp/kllm_test")
+        s1_lut, _ = compiler._build_gate_lut()
+        assert np.all(s1_lut <= 7)
+
+
+class TestStoreWeightGates:
+    def test_stores_planes_and_gates(self):
+        compiler = LosslessLogicCompiler(model_name="dummy", save_dir="/tmp/kllm_test")
+        s1_lut, mask_lut = compiler._build_gate_lut()
+
+        weight = np.array([[1.0, -2.0], [0.5, 3.14]], dtype=np.float32)
+        dest: dict = {}
+        _store_weight_gates(dest, "test", weight, s1_lut, mask_lut)
+
+        # Should have byte planes AND gate arrays
+        for i in range(4):
+            assert f"test_m{i}" in dest
+            assert f"test_m{i}_s1" in dest
+            assert f"test_m{i}_mask" in dest
+            assert dest[f"test_m{i}_s1"].shape == weight.shape
+            assert dest[f"test_m{i}_mask"].shape == weight.shape

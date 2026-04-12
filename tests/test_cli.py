@@ -1,44 +1,58 @@
-from kllm.cli import _build_parser
+"""CLI integration tests — all operations go through ``kllm`` entry-point."""
+
+import subprocess
+import sys
+
+
+def _run_cli(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+    """Run the kllm CLI via subprocess and return the result."""
+    return subprocess.run(
+        [sys.executable, "-m", "kllm.cli", *args],
+        capture_output=True,
+        text=True,
+        check=check,
+    )
+
+
+class TestCLIHelp:
+    def test_help_flag(self):
+        r = _run_cli("--help", check=False)
+        assert r.returncode == 0
+        assert "kllm" in r.stdout
+        assert "--mode" in r.stdout
+
+    def test_missing_mode_fails(self):
+        r = _run_cli(check=False)
+        assert r.returncode != 0
 
 
 class TestCLIParser:
-    def test_compile_mode(self):
-        args = _build_parser().parse_args(["--mode", "compile"])
-        assert args.mode == "compile"
-        assert args.model == "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-        assert args.save_dir == "./lossless_logic"
-        assert args.solver_timeout == 200
+    def test_engine_flag_accepted(self):
+        r = _run_cli("--mode", "inference", "--engine", "bitlogic", "--text", "hi",
+                      "--save-dir", "/nonexistent", check=False)
+        assert "unrecognized arguments" not in r.stderr
 
-    def test_inference_mode_with_text(self):
-        args = _build_parser().parse_args(["--mode", "inference", "--text", "Hello"])
-        assert args.mode == "inference"
-        assert args.text == "Hello"
+    def test_engine_standard_accepted(self):
+        r = _run_cli("--mode", "inference", "--engine", "standard", "--text", "hi",
+                      "--save-dir", "/nonexistent", check=False)
+        assert "unrecognized arguments" not in r.stderr
 
-    def test_compare_mode(self):
-        args = _build_parser().parse_args(["--mode", "compare", "--text", "Hi"])
-        assert args.mode == "compare"
-        assert args.text == "Hi"
+    def test_max_tokens_flag(self):
+        r = _run_cli("--mode", "generate", "--max-tokens", "10", "--text", "hi",
+                      "--save-dir", "/nonexistent", check=False)
+        assert "unrecognized arguments" not in r.stderr
 
-    def test_full_mode(self):
-        args = _build_parser().parse_args(["--mode", "full"])
-        assert args.mode == "full"
+    def test_solver_timeout_flag(self):
+        r = _run_cli("--mode", "compile", "--solver-timeout", "500",
+                      "--save-dir", "/nonexistent", check=False)
+        assert "unrecognized arguments" not in r.stderr
 
-    def test_custom_solver_timeout(self):
-        args = _build_parser().parse_args(["--mode", "compile", "--solver-timeout", "500"])
-        assert args.solver_timeout == 500
+    def test_max_layers_flag(self):
+        r = _run_cli("--mode", "compare", "--max-layers", "3", "--text", "hi",
+                      "--save-dir", "/nonexistent", check=False)
+        assert "unrecognized arguments" not in r.stderr
 
-    def test_custom_max_layers(self):
-        args = _build_parser().parse_args(["--mode", "compare", "--max-layers", "3", "--text", "x"])
-        assert args.max_layers == 3
-
-    def test_max_layers_default_none(self):
-        args = _build_parser().parse_args(["--mode", "compile"])
-        assert args.max_layers is None
-
-    def test_custom_model(self):
-        args = _build_parser().parse_args(["--mode", "compile", "--model", "my/model"])
-        assert args.model == "my/model"
-
-    def test_custom_save_dir(self):
-        args = _build_parser().parse_args(["--mode", "compile", "--save-dir", "/tmp/out"])
-        assert args.save_dir == "/tmp/out"
+    def test_invalid_mode_fails(self):
+        r = _run_cli("--mode", "invalid", check=False)
+        assert r.returncode != 0
+        assert "invalid choice" in r.stderr

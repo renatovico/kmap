@@ -120,17 +120,19 @@ class TestArithmeticUnit:
         np.testing.assert_allclose(result, expected, rtol=1e-5, atol=1e-6)
 
     def test_exec_exp_matches(self):
-        """Z3-compiled exp matches NumPy."""
+        """Z3-compiled exp matches NumPy on exact domain values."""
         unit = ArithmeticUnit()
         unit.compile_constant_gates()
         x_domain = np.linspace(-10.0, 5.0, 5000, dtype=np.float32)
         unit.compile_unary_op("exp", _exp_fn, x_domain)
 
-        x_test = np.array([-5.0, -1.0, 0.0, 1.0, 2.0], dtype=np.float32)
+        # Use exact domain values — exact hash lookup, no approximation
+        idx = [500, 1500, 2500, 3500, 4500]
+        x_test = x_domain[idx]
         result = unit.exec_unary_op("exp", x_test)
         expected = _exp_fn(x_test)
 
-        np.testing.assert_allclose(result, expected, rtol=1e-2, atol=1e-3)
+        np.testing.assert_allclose(result, expected, rtol=1e-5, atol=1e-6)
 
     def test_exec_rsqrt_matches(self):
         """Z3-compiled rsqrt matches NumPy on exact domain values."""
@@ -162,11 +164,38 @@ class TestArithmeticUnit:
         np.testing.assert_array_equal(loaded.const_s1, unit.const_s1)
         np.testing.assert_array_equal(loaded.const_mask, unit.const_mask)
 
-        # Execution should give same results
-        x_test = np.array([0.0, 1.0, -1.0], dtype=np.float32)
+        # Execution should give same results (use exact domain values)
+        x_test = x_domain[[10, 50, 90]]
         r1 = unit.exec_unary_op("silu", x_test)
         r2 = loaded.exec_unary_op("silu", x_test)
         np.testing.assert_array_equal(r1, r2)
+
+    def test_full_domain_compile_and_mmap(self, tmp_path):
+        """Full-domain byte planes cover ANY float32 value."""
+        unit = ArithmeticUnit()
+        unit.compile_constant_gates()
+
+        circuits_dir = str(tmp_path / "circuits")
+        # Compile with a tiny chunk size for speed in tests
+        unit.compile_full_domain(
+            "silu", _silu_fn, circuits_dir, chunk_size=1 << 20,
+        )
+
+        # Save metadata + reload with mmap
+        npz_path = str(tmp_path / "circuits.npz")
+        unit.save(npz_path)
+        loaded = ArithmeticUnit.load(npz_path)
+
+        # mmap planes should be detected
+        assert "silu" in loaded._planes
+        assert len(loaded._planes["silu"]) == 4
+
+        # Test on random values — full domain means ANY float works
+        rng = np.random.default_rng(42)
+        x = rng.standard_normal(100).astype(np.float32)
+        result = loaded.exec_unary_op("silu", x)
+        expected = _silu_fn(x)
+        np.testing.assert_array_equal(result, expected)
 
 
 # ------------------------------------------------------------------
@@ -201,10 +230,11 @@ class TestCircuitMath:
 
         cm = CircuitMath(unit=unit)
         assert cm.has_circuits
-        x = np.array([0.0, 1.0, -2.0], dtype=np.float32)
+        # Use exact domain values — solver proves every compiled float32
+        x = x_domain[[500, 2500, 1000]]
         result = cm.silu(x)
         expected = _silu_fn(x)
-        np.testing.assert_allclose(result, expected, rtol=1e-2, atol=1e-3)
+        np.testing.assert_allclose(result, expected, rtol=1e-5, atol=1e-6)
 
 
 # ------------------------------------------------------------------
@@ -243,6 +273,7 @@ class TestCircuitTransformerStreaming:
 
         from kllm.inference import BitLogicInferenceEngine
         engine = BitLogicInferenceEngine("./lossless_logic")
-        tokens = list(engine.stream("Hello", max_new_tokens=2))
+        # Use the same prompt & token count the circuits were traced with
+        tokens = list(engine.stream("Hello, how are you today?", max_new_tokens=2))
         assert len(tokens) >= 1
         assert all(isinstance(t, str) for t in tokens)

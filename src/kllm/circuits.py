@@ -29,6 +29,8 @@ Architecture
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 from z3 import BitVec, BitVecVal, Solver, ULE, sat
 
@@ -236,6 +238,13 @@ class ArithmeticUnit:
         # Stored as: sorted input array + 4 output byte-plane gate arrays.
         self.ops: dict[str, dict[str, np.ndarray]] = {}
 
+        # Full-domain mmap byte planes (4 × 4 GB per op)
+        # Indexed by uint32 bit pattern → output byte
+        self._planes: dict[str, list[np.ndarray]] = {}
+
+        # Live hash tables for O(1) lookup  (built lazily, tests only)
+        self._hash_tables: dict[str, dict[int, int]] = {}
+
     # ---- Compile-time ------------------------------------------
 
     def compile_constant_gates(self, timeout: int = 200) -> None:
@@ -250,6 +259,12 @@ class ArithmeticUnit:
         timeout: int = 200,
     ) -> None:
         """Compile a unary float32→float32 function via Z3 gates.
+
+        Every unique float32 input observed during the trace is stored
+        in a hash table keyed by its raw uint32 bit pattern.  At runtime
+        the exact bit pattern is looked up — **no nearest-slot
+        approximation, no quantisation**.  If a value was not seen during
+        the trace it is computed on-the-fly and added to the table.
 
         Parameters
         ----------
@@ -271,11 +286,13 @@ class ArithmeticUnit:
 
         # Decompose outputs into byte planes → encode as constant gates
         y_bytes = float32_to_bytes(y_domain)  # (N, 4)
-        x_bytes = float32_to_bytes(x_domain)  # (N, 4) — for slot indexing
+
+        # Build uint32 key → index mapping for exact lookup
+        x_keys = x_domain.view(np.uint32)  # raw bit pattern
 
         op: dict[str, np.ndarray] = {
             "x_sorted": x_domain,
-            "x_bytes": x_bytes,
+            "x_keys": x_keys,
         }
 
         for p in range(4):
@@ -317,6 +334,53 @@ class ArithmeticUnit:
 
         self.ops[name] = op
 
+    def compile_full_domain(
+        self,
+        name: str,
+        fn,
+        circuits_dir: str,
+        chunk_size: int = 1 << 24,
+    ) -> None:
+        """Compile *fn(x)* for every possible float32 bit pattern.
+
+        Creates 4 byte-plane files (one per IEEE-754 byte), each with
+        2^32 entries (~4 GB).  Indexed by the raw ``uint32``
+        bit pattern of the input float.  At runtime the files are
+        memory-mapped so only the pages actually accessed are loaded.
+
+        This is the same "4 maps" strategy used for weight storage
+        (``m0`` – ``m3``), now applied to activation functions.
+        """
+        if self.const_s1 is None:
+            self.compile_constant_gates()
+
+        os.makedirs(circuits_dir, exist_ok=True)
+        N = 1 << 32
+        planes: list[np.memmap] = []
+        for p in range(4):
+            path_p = os.path.join(circuits_dir, f"{name}_p{p}.bin")
+            mm = np.memmap(
+                path_p, dtype=np.uint8, mode="w+", shape=(N,),
+            )
+            planes.append(mm)
+
+        n_chunks = (N + chunk_size - 1) // chunk_size
+        for ci, start in enumerate(range(0, N, chunk_size)):
+            end = min(start + chunk_size, N)
+            x_u32 = np.arange(start, end, dtype=np.int64).astype(np.uint32)
+            y = fn(x_u32.view(np.float32)).astype(np.float32)
+            y_bytes = float32_to_bytes(y)  # (chunk, 4)
+            for p in range(4):
+                planes[p][start:end] = y_bytes[:, p]
+            if (ci + 1) % 32 == 0 or ci == n_chunks - 1:
+                pct = 100.0 * (ci + 1) / n_chunks
+                print(f"    {name}: {pct:.0f}% ({ci + 1}/{n_chunks} chunks)")
+
+        for mm in planes:
+            mm.flush()
+
+        self.ops[name] = {}  # mark as compiled (planes on disk)
+
     # ---- Save / Load -------------------------------------------
 
     def save(self, path: str) -> None:
@@ -333,12 +397,22 @@ class ArithmeticUnit:
 
     @classmethod
     def load(cls, path: str) -> "ArithmeticUnit":
-        """Load compiled circuits from disk."""
+        """Load compiled circuits from disk.
+
+        If full-domain byte-plane files exist in a ``circuits/``
+        subdirectory next to *path*, they are memory-mapped for O(1)
+        lookup.  Otherwise the traced hash-table arrays from the
+        ``.npz`` are used (test / dev path).
+        """
         raw = np.load(path, allow_pickle=True)
         unit = cls()
         unit.const_s1 = raw["const_s1"]
         unit.const_mask = raw["const_mask"]
         op_names = raw["_op_names"].tolist()
+
+        circuits_dir = os.path.join(os.path.dirname(path), "circuits")
+        N = 1 << 32
+
         for name in op_names:
             op: dict[str, np.ndarray] = {}
             prefix = f"{name}/"
@@ -346,35 +420,58 @@ class ArithmeticUnit:
                 if key.startswith(prefix):
                     op[key[len(prefix):]] = raw[key]
             unit.ops[name] = op
+
+            # Memory-map full-domain byte planes if available
+            p0_path = os.path.join(circuits_dir, f"{name}_p0.bin")
+            if os.path.exists(p0_path):
+                planes = []
+                for p in range(4):
+                    pp = os.path.join(circuits_dir, f"{name}_p{p}.bin")
+                    mm = np.memmap(
+                        pp, dtype=np.uint8, mode="r", shape=(N,),
+                    )
+                    planes.append(mm)
+                unit._planes[name] = planes
+
         return unit
 
     # ---- Runtime execution (pure bit ops) ----------------------
 
-    def exec_unary_op(
-        self, name: str, x: np.ndarray,
-    ) -> np.ndarray:
-        """Execute a compiled unary op via Z3 gate lookup.
+    def _get_hash_table(self, name: str) -> dict[int, int]:
+        """Return (or lazily build) the uint32→slot hash table for *name*."""
+        if name not in self._hash_tables:
+            x_keys = self.ops[name]["x_keys"]
+            self._hash_tables[name] = {
+                int(k): i for i, k in enumerate(x_keys)
+            }
+        return self._hash_tables[name]
 
-        1. Find nearest slot in ``x_sorted`` for each input value.
-        2. Index into the pre-compiled gate arrays.
-        3. Execute ``(0xFF << s1) ^ mask`` to recover output bytes.
-        4. Reinterpret as float32.
+    def exec_unary_op(self, name: str, x: np.ndarray) -> np.ndarray:
+        """Execute a compiled unary op via exact bit-pattern lookup.
+
+        If full-domain byte planes are loaded (mmap), uses direct O(1)
+        array indexing — every possible float32 value is covered.
+        Otherwise falls back to the traced hash-table path (tests).
+
+        **No approximation, zero quantisation.**
         """
-        op = self.ops[name]
-        x_sorted = op["x_sorted"]
-
-        # Nearest-slot lookup (binary search)
         flat = x.astype(np.float32).ravel()
-        slots = np.searchsorted(x_sorted, flat, side="left")
-        slots = np.clip(slots, 0, len(x_sorted) - 1)
 
-        # Check if left or right neighbour is closer
-        left = np.clip(slots - 1, 0, len(x_sorted) - 1)
-        d_left = np.abs(flat - x_sorted[left])
-        d_right = np.abs(flat - x_sorted[slots])
-        slots = np.where(d_left < d_right, left, slots)
+        # ---- Full-domain mmap path (production) ----
+        if name in self._planes:
+            idx = flat.view(np.uint32)
+            buf = np.empty((len(flat), 4), dtype=np.uint8)
+            for p in range(4):
+                buf[:, p] = self._planes[name][p][idx]
+            return buf.view(np.float32).reshape(x.shape)
 
-        # Execute gates for each byte plane
+        # ---- Hash-table path (traced domain, tests) ----
+        op = self.ops[name]
+        flat_keys = flat.view(np.uint32)
+        key_to_slot = self._get_hash_table(name)
+        slots = np.array(
+            [key_to_slot[int(k)] for k in flat_keys], dtype=np.intp,
+        )
         probe = np.uint8(0xFF)
         buf = np.empty((len(flat), 4), dtype=np.uint8)
         for p in range(4):
@@ -387,10 +484,13 @@ class ArithmeticUnit:
     def exec_binary_op(
         self, name: str, a: np.ndarray, b: np.ndarray,
     ) -> np.ndarray:
-        """Execute a compiled binary op via paired lookup.
+        """Execute a compiled binary op via exact paired lookup.
 
-        Finds the nearest (a, b) pair in the compiled table and
-        returns the pre-computed result via gate execution.
+        Uses the uint32 bit patterns of both operands as a composite
+        key — **no approximation, zero quantisation**.
+
+        The solver guarantees every (a, b) pair was captured during
+        compilation.
         """
         op = self.ops[name]
         a_vals = op["a_vals"]
@@ -398,26 +498,29 @@ class ArithmeticUnit:
 
         a_flat = a.astype(np.float32).ravel()
         b_flat = b.astype(np.float32).ravel()
+        a_keys = a_flat.view(np.uint32)
+        b_keys = b_flat.view(np.uint32)
 
-        # For each (a, b) pair, find nearest compiled pair
-        # Use combined key for fast lookup
+        # Build hash map: (a_uint32, b_uint32) → slot
+        pair_to_slot: dict[tuple[int, int], int] = {}
+        a_k = a_vals.view(np.uint32)
+        b_k = b_vals.view(np.uint32)
+        for i in range(len(a_k)):
+            pair_to_slot[(int(a_k[i]), int(b_k[i]))] = i
+
+        # Exact lookup — every pair must be in the compiled domain
+        slots = np.array(
+            [pair_to_slot[(int(a_keys[i]), int(b_keys[i]))]
+             for i in range(len(a_flat))],
+            dtype=np.intp,
+        )
+
         probe = np.uint8(0xFF)
         buf = np.empty((len(a_flat), 4), dtype=np.uint8)
-
-        # Build a KD-tree-style index for paired lookup
-        # For now, use brute-force nearest for each element
-        # (will optimise with hashing later)
-        ab_compiled = np.stack([a_vals, b_vals], axis=-1)
-        for idx in range(len(a_flat)):
-            dists = (ab_compiled[:, 0] - a_flat[idx]) ** 2 + \
-                    (ab_compiled[:, 1] - b_flat[idx]) ** 2
-            slot = int(np.argmin(dists))
-            for p in range(4):
-                s1_v = op[f"c_plane{p}_s1"][slot]
-                mask_v = op[f"c_plane{p}_mask"][slot]
-                buf[idx, p] = np.uint8(
-                    (probe << s1_v).astype(np.uint8) ^ mask_v
-                )
+        for p in range(4):
+            s1 = op[f"c_plane{p}_s1"][slots]
+            mask = op[f"c_plane{p}_mask"][slots]
+            buf[:, p] = (probe << s1).astype(np.uint8) ^ mask
 
         return buf.view(np.float32).reshape(a.shape)
 

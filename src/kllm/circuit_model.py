@@ -45,7 +45,7 @@ class CircuitMath:
     def silu(self, x: np.ndarray) -> np.ndarray:
         if self._unit and "silu" in self._unit.ops:
             return self._unit.exec_unary_op("silu", x)
-        return x * (1.0 / (1.0 + np.exp(-x.astype(np.float64)))).astype(np.float32)
+        return (x * (1.0 / (1.0 + np.exp(-x.astype(np.float64))))).astype(np.float32)
 
     def exp(self, x: np.ndarray) -> np.ndarray:
         if self._unit and "exp" in self._unit.ops:

@@ -7,6 +7,7 @@ Runs the same prompt through:
 and prints a side-by-side report of generated text and timing.
 """
 
+import os
 import time
 
 import torch
@@ -46,7 +47,11 @@ def compare_generate(
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     # ---- kllm engine ----
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tok_dir = os.path.join(save_dir, "tokenizer")
+    if os.path.isdir(tok_dir):
+        tokenizer = AutoTokenizer.from_pretrained(tok_dir)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
     prompt = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True,
     )

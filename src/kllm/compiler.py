@@ -120,6 +120,8 @@ class LosslessLogicCompiler:
         import torch
         from transformers import AutoModelForCausalLM
 
+        from transformers import AutoTokenizer
+
         print(f"[*] Loading {self.model_name} …")
         model = AutoModelForCausalLM.from_pretrained(
             self.model_name, torch_dtype=torch.float32
@@ -127,6 +129,12 @@ class LosslessLogicCompiler:
         config = model.config
         layers = model.model.layers
         num_layers = len(layers)
+
+        # ---- Save tokenizer locally so inference never hits the Hub ----
+        tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        tok_dir = os.path.join(self.save_dir, "tokenizer")
+        tokenizer.save_pretrained(tok_dir)
+        print(f"  -> saved tokenizer to {tok_dir}")
 
         # ---- Build Z3 gate lookup table for all 256 byte values ------
         s1_lut, mask_lut = self._build_gate_lut()

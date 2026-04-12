@@ -142,10 +142,14 @@ class BitLogicInferenceEngine:
         self.head_dim = self.hidden_size // self.num_heads
         self.num_groups = self.num_heads // self.num_kv_heads
 
-        # ---- Tokenizer ----
+        # ---- Tokenizer (prefer local copy saved at compile time) ----
         from transformers import AutoTokenizer
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        tok_dir = os.path.join(save_dir, "tokenizer")
+        if os.path.isdir(tok_dir):
+            self.tokenizer = AutoTokenizer.from_pretrained(tok_dir)
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
         # ---- Pre-compute RoPE tables (up to max seq) ----
         max_seq = 2048

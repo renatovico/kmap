@@ -75,6 +75,7 @@ class Op(str, Enum):
 
     # Linear algebra
     MATMUL      = "matmul"
+    MATMUL_Q8   = "matmul_q8"    # quantized: x_f32 @ W_int8 * scales
 
     # Reductions
     SUM         = "sum"
@@ -196,6 +197,16 @@ class CircuitGraph:
 
     def matmul(self, a: int, b: int, name: str = "") -> int:
         return self._add_node(Op.MATMUL, [a, b], name=name)
+
+    def matmul_q8(self, x: int, weight_q8: int, scales: int,
+                  name: str = "") -> int:
+        """Quantized matmul: x_f32 @ W_int8 * scales_f32.
+
+        Inputs: x (float32), weight_q8 (int8 CONST), scales (float32 CONST).
+        The executor reads 4x less weight memory.
+        """
+        return self._add_node(Op.MATMUL_Q8, [x, weight_q8, scales],
+                              name=name)
 
     # ---- Reductions ---------------------------------------------
 
@@ -617,6 +628,13 @@ def evaluate(graph: CircuitGraph,
         elif node.op == Op.MATMUL:
             values[nid] = (np.asarray(inp[0], dtype=np.float32)
                            @ np.asarray(inp[1], dtype=np.float32))
+
+        elif node.op == Op.MATMUL_Q8:
+            # inp[0]=activation(f32), inp[1]=weight(int8), inp[2]=scales(f32)
+            x = np.asarray(inp[0], dtype=np.float32)
+            w_q8 = np.asarray(inp[1])
+            scales = np.asarray(inp[2], dtype=np.float32)
+            values[nid] = (x @ w_q8.astype(np.float32)) * scales
 
         elif node.op == Op.SUM:
             values[nid] = np.asarray(inp[0], dtype=np.float32).sum(

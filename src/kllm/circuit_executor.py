@@ -24,6 +24,10 @@ import numpy as np
 
 from kllm.circuit_graph import CircuitGraph, Op
 
+# Module-level ctypes pointer types (avoid repeated POINTER() calls)
+_FP = ctypes.POINTER(ctypes.c_float)
+_I8P = ctypes.POINTER(ctypes.c_int8)
+
 # ---------------------------------------------------------------
 # Library loading
 # ---------------------------------------------------------------
@@ -137,6 +141,11 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
     lib.ceval_copy.restype = None
     lib.ceval_copy.argtypes = [FP, FP, I]
 
+    # Quantized matmul (x_f32 @ W_int8 * scales_f32)
+    I8P = ctypes.POINTER(ctypes.c_int8)
+    lib.ceval_matmul_q8.restype = None
+    lib.ceval_matmul_q8.argtypes = [FP, FP, I, I, I8P, I, FP]
+
 
 # ---------------------------------------------------------------
 # Shape utilities (pure Python — no NumPy)
@@ -191,6 +200,12 @@ def _to_c_float(arr: np.ndarray) -> ctypes.POINTER(ctypes.c_float):
     return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
 
+def _to_c_int8(arr: np.ndarray) -> ctypes.POINTER(ctypes.c_int8):
+    """Get a ctypes int8 pointer to a contiguous int8 array."""
+    arr = np.ascontiguousarray(arr, dtype=np.int8)
+    return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int8))
+
+
 def _to_c_int_array(values: tuple | list) -> ctypes.Array:
     """Create a ctypes int array from a Python sequence."""
     n = len(values)
@@ -230,6 +245,7 @@ _T_REPEAT = 13
 _T_SLICE = 14
 _T_CAST = 15
 _T_EXPAND_DIMS = 16
+_T_MATMUL_Q8 = 17
 
 _BINOP_FN = {
     Op.ADD: np.add,
@@ -266,7 +282,7 @@ class ExecutionPlan:
     """
 
     __slots__ = ("_base_values", "_input_nids", "_tape", "_lib",
-                 "_num_nodes")
+                 "_num_nodes", "_const_ptrs")
 
     def __init__(self, graph: CircuitGraph,
                  const_cache: dict[int, np.ndarray] | None = None) -> None:
@@ -279,14 +295,30 @@ class ExecutionPlan:
 
         # Pre-seed CONST values into the base array
         base: list[np.ndarray | None] = [None] * n
+        const_ids: set[int] = set()
         for node in graph.nodes:
             if node.op == Op.CONST:
+                const_ids.add(node.id)
                 if node.id in const_cache:
                     base[node.id] = const_cache[node.id]
                 else:
                     base[node.id] = np.ascontiguousarray(
                         node.params["value"])
         self._base_values = base
+
+        # Pre-cache ctypes pointers for CONST arrays (avoids repeated
+        # ctypes.cast calls at runtime — saves ~10ms/step).
+        const_ptrs: dict[int, object] = {}  # nid → ctypes pointer
+        for nid in const_ids:
+            arr = base[nid]
+            if arr is not None:
+                if arr.dtype == np.int8:
+                    const_ptrs[nid] = arr.ctypes.data_as(_I8P)
+                else:
+                    arr_f32 = np.ascontiguousarray(arr, dtype=np.float32)
+                    base[nid] = arr_f32  # ensure base has f32 version
+                    const_ptrs[nid] = arr_f32.ctypes.data_as(_FP)
+        self._const_ptrs = const_ptrs
 
         # INPUT node IDs (for validation at runtime)
         self._input_nids: list[int] = []
@@ -332,6 +364,20 @@ class ExecutionPlan:
 
             elif node.op == Op.MATMUL:
                 tape.append((_T_MATMUL, nid, ins[0], ins[1]))
+
+            elif node.op == Op.MATMUL_Q8:
+                # inputs: [activation, weight_q8, scales]
+                # Pre-resolve CONST weight/scales pointers, shapes,
+                # and pre-allocate output buffer.
+                wq8_nid, scales_nid = ins[1], ins[2]
+                wq8_arr = base[wq8_nid]
+                scales_arr = base[scales_nid]
+                K_q8 = wq8_arr.shape[0]
+                N = wq8_arr.shape[-1]
+                wq8_ptr = const_ptrs.get(wq8_nid)
+                scales_ptr = const_ptrs.get(scales_nid)
+                tape.append((_T_MATMUL_Q8, nid, ins[0],
+                             wq8_ptr, K_q8, N, scales_ptr))
 
             elif node.op in _REDUCE_FN:
                 axis = node.params["axis"]
@@ -402,6 +448,19 @@ class ExecutionPlan:
                 v[instr[1]] = np.matmul(
                     np.ascontiguousarray(v[instr[2]], dtype=np.float32),
                     np.ascontiguousarray(v[instr[3]], dtype=np.float32))
+
+            elif tag == _T_MATMUL_Q8:
+                # (tag, nid, x_id, wq8_ptr, K, N, scales_ptr)
+                x = np.ascontiguousarray(v[instr[2]], dtype=np.float32)
+                K = instr[4]
+                N = instr[5]
+                out = np.empty((1, N), dtype=np.float32)
+                self._lib.ceval_matmul_q8(
+                    out.ctypes.data_as(_FP),
+                    x.ctypes.data_as(_FP), 1, K,
+                    instr[3], N,   # pre-cached wq8 pointer
+                    instr[6])      # pre-cached scales pointer
+                v[instr[1]] = out
 
             elif tag == _T_LUT:
                 # (tag, nid, i0, c_fn)
@@ -513,6 +572,517 @@ def precompute_consts(graph: CircuitGraph) -> dict[int, np.ndarray]:
 
 
 # ---------------------------------------------------------------
+# C Tape Runner — execute entire tape in one C call
+# ---------------------------------------------------------------
+
+_TAPE_LIB: ctypes.CDLL | None = None
+
+
+def _get_tape_lib() -> ctypes.CDLL:
+    """Load the _tape_runner shared library."""
+    global _TAPE_LIB
+    if _TAPE_LIB is not None:
+        return _TAPE_LIB
+
+    csrc_dir = Path(__file__).resolve().parent.parent.parent / "csrc"
+    suffix = ".dylib" if platform.system() == "Darwin" else ".so"
+    so_path = csrc_dir / f"_tape_runner{suffix}"
+    if not so_path.exists():
+        so_path = csrc_dir / "_tape_runner.so"
+    if not so_path.exists():
+        # Try to compile
+        src = csrc_dir / "_tape_runner.c"
+        if src.exists():
+            _compile_tape_runner(src, so_path)
+    _TAPE_LIB = ctypes.CDLL(str(so_path))
+    _setup_tape_lib(_TAPE_LIB)
+    return _TAPE_LIB
+
+
+def _compile_tape_runner(src: Path, out: Path) -> None:
+    """Compile _tape_runner.c."""
+    if platform.system() == "Darwin":
+        cmd = ["cc", "-O3", "-shared", "-fPIC", "-march=native",
+               "-o", str(out), str(src), "-lm", "-framework", "Accelerate"]
+    else:
+        cmd = ["cc", "-O3", "-shared", "-fPIC", "-march=native",
+               "-o", str(out), str(src), "-lm", "-lopenblas"]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
+def _setup_tape_lib(lib: ctypes.CDLL) -> None:
+    """Set up ctypes signatures for the tape runner."""
+    VP = ctypes.c_void_p
+    IP = ctypes.POINTER(ctypes.c_int)
+    FP = ctypes.POINTER(ctypes.c_float)
+    I = ctypes.c_int
+
+    lib.tape_ctx_create.restype = VP
+    lib.tape_ctx_create.argtypes = [I, I]
+
+    lib.tape_ctx_destroy.restype = None
+    lib.tape_ctx_destroy.argtypes = [VP]
+
+    lib.tape_slot_alloc.restype = None
+    lib.tape_slot_alloc.argtypes = [VP, I, IP, I]
+
+    lib.tape_slot_set_external.restype = None
+    lib.tape_slot_set_external.argtypes = [VP, I, FP, IP, I]
+
+    lib.tape_slot_write.restype = None
+    lib.tape_slot_write.argtypes = [VP, I, FP, I]
+
+    lib.tape_slot_set_shape.restype = None
+    lib.tape_slot_set_shape.argtypes = [VP, I, IP, I]
+
+    lib.tape_slot_read.restype = FP
+    lib.tape_slot_read.argtypes = [VP, I, IP]
+
+    lib.tape_get_instr.restype = VP
+    lib.tape_get_instr.argtypes = [VP, I]
+
+    lib.tape_run.restype = None
+    lib.tape_run.argtypes = [VP]
+
+    lib.tape_slot_read_shape.restype = I
+    lib.tape_slot_read_shape.argtypes = [VP, I, IP]
+
+
+# C tape instruction tags (match _tape_runner.c enum)
+_CT_LUT_SILU  = 0
+_CT_LUT_EXP   = 1
+_CT_LUT_RSQRT = 2
+_CT_LUT_COS   = 3
+_CT_LUT_SIN   = 4
+_CT_ADD       = 5
+_CT_SUB       = 6
+_CT_MUL       = 7
+_CT_DIV       = 8
+_CT_MAX       = 9
+_CT_NEG       = 10
+_CT_SQUARE    = 11
+_CT_MATMUL    = 12
+_CT_MATMUL_Q8 = 13
+_CT_SUM       = 14
+_CT_MAX_RED   = 15
+_CT_MEAN      = 16
+_CT_ARGMAX    = 17
+_CT_RESHAPE   = 18
+_CT_TRANSPOSE = 19
+_CT_CONCAT    = 20
+_CT_REPEAT    = 21
+_CT_SLICE     = 22
+_CT_COPY      = 23
+
+_LUT_TAG_MAP = {
+    "silu": _CT_LUT_SILU, "exp": _CT_LUT_EXP, "rsqrt": _CT_LUT_RSQRT,
+    "cos": _CT_LUT_COS, "sin": _CT_LUT_SIN,
+}
+
+_BINOP_TAG = {
+    Op.ADD: _CT_ADD, Op.SUB: _CT_SUB, Op.MUL: _CT_MUL,
+    Op.DIV: _CT_DIV, Op.MAX: _CT_MAX,
+}
+
+_REDUCE_TAG = {
+    Op.SUM: _CT_SUM, Op.MAX_REDUCE: _CT_MAX_RED, Op.MEAN: _CT_MEAN,
+}
+
+
+class _TapeInstrFields(ctypes.Structure):
+    """Mirror of C TapeInstr struct for field access."""
+    _fields_ = [
+        ("tag", ctypes.c_int),
+        ("out_slot", ctypes.c_int),
+        ("in0", ctypes.c_int),
+        ("in1", ctypes.c_int),
+        ("in2", ctypes.c_int),
+        ("axis", ctypes.c_int),
+        ("keepdims", ctypes.c_int),
+        ("repeats", ctypes.c_int),
+        ("out_shape", ctypes.c_int * 8),
+        ("out_ndim", ctypes.c_int),
+        ("out_size", ctypes.c_int),
+        ("wq8_ptr", ctypes.c_void_p),
+        ("scales_ptr", ctypes.c_void_p),
+        ("K_q8", ctypes.c_int),
+        ("N_q8", ctypes.c_int),
+        ("axes", ctypes.c_int * 8),
+        ("starts", ctypes.c_int * 8),
+        ("stops", ctypes.c_int * 8),
+        ("steps", ctypes.c_int * 8),
+        ("slice_out_shape", ctypes.c_int * 8),
+        ("slice_out_ndim", ctypes.c_int),
+        ("concat_inputs", ctypes.c_int * 8),
+        ("concat_n_inputs", ctypes.c_int),
+    ]
+
+
+def _int_arr(vals):
+    """Make a ctypes int array from a sequence."""
+    return (ctypes.c_int * len(vals))(*vals)
+
+
+class CTapeRunner:
+    """Execute the decode machine tape entirely in C.
+
+    Translates an ExecutionPlan + CircuitGraph into a C TapeCtx,
+    then each ``run()`` call does one ``tape_run()`` C call —
+    zero Python iteration over 1371 tape instructions.
+    """
+
+    def __init__(self, graph: CircuitGraph,
+                 const_cache: dict[int, np.ndarray] | None = None,
+                 sample_inputs: dict[int, np.ndarray] | None = None):
+        self._lib = _get_tape_lib()
+        self._graph = graph
+        nodes = graph.nodes
+        n_slots = len(nodes)
+
+        # Phase 1: evaluate shapes by doing one forward pass
+        const_cache = const_cache or {}
+        sample_inputs = sample_inputs or {}
+        shapes: dict[int, tuple] = {}
+        slot_data: dict[int, np.ndarray] = {}
+
+        # Collect CONST and INPUT node info
+        const_ids: set[int] = set()
+        input_ids: list[int] = []
+        for node in nodes:
+            if node.op == Op.CONST:
+                const_ids.add(node.id)
+                arr = const_cache.get(node.id)
+                if arr is None:
+                    arr = np.ascontiguousarray(node.params["value"])
+                slot_data[node.id] = arr
+                shapes[node.id] = arr.shape
+            elif node.op == Op.INPUT:
+                input_ids.append(node.id)
+                if node.id in sample_inputs:
+                    s = sample_inputs[node.id].shape
+                else:
+                    s = node.params.get("shape", (1,))
+                shapes[node.id] = s
+                slot_data[node.id] = np.zeros(s, dtype=np.float32)
+
+        # Build topological order and compile instructions
+        order = graph.topological_order()
+        instrs = []  # list of (c_tag, out_slot, params_dict)
+
+        for nid in order:
+            node = nodes[nid]
+            if node.op in (Op.CONST, Op.INPUT):
+                continue
+
+            ins = tuple(node.inputs)
+            p = {"in0": ins[0] if len(ins) > 0 else -1,
+                 "in1": ins[1] if len(ins) > 1 else -1,
+                 "in2": ins[2] if len(ins) > 2 else -1}
+
+            # Compute output shape from inputs
+            if node.op == Op.LUT:
+                s = shapes[ins[0]]
+                shapes[nid] = s
+                tag = _LUT_TAG_MAP[node.params["fn"]]
+                instrs.append((tag, nid, p))
+
+            elif node.op in _BINOP_TAG:
+                s0 = shapes[ins[0]]
+                s1 = shapes[ins[1]]
+                out_s = np.broadcast_shapes(s0, s1)
+                shapes[nid] = out_s
+                p["out_shape"] = out_s
+                instrs.append((_BINOP_TAG[node.op], nid, p))
+
+            elif node.op == Op.NEG:
+                shapes[nid] = shapes[ins[0]]
+                instrs.append((_CT_NEG, nid, p))
+
+            elif node.op == Op.SQUARE:
+                shapes[nid] = shapes[ins[0]]
+                instrs.append((_CT_SQUARE, nid, p))
+
+            elif node.op == Op.MATMUL:
+                s0, s1 = shapes[ins[0]], shapes[ins[1]]
+                out_s = s0[:-1] + (s1[-1],)
+                if len(s0) > 2:
+                    out_s = s0[:-2] + (s0[-2], s1[-1])
+                shapes[nid] = out_s
+                instrs.append((_CT_MATMUL, nid, p))
+
+            elif node.op == Op.MATMUL_Q8:
+                wq8 = slot_data.get(ins[1])
+                scales = slot_data.get(ins[2])
+                s_in = shapes[ins[0]]
+                K_q8 = wq8.shape[0] if wq8 is not None else 0
+                N_q8 = wq8.shape[1] if wq8 is not None else 0
+                M = s_in[0] if len(s_in) >= 2 else 1
+                shapes[nid] = (M, N_q8)
+                p["wq8_ptr"] = wq8.ctypes.data if wq8 is not None else 0
+                p["scales_ptr"] = scales.ctypes.data if scales is not None else 0
+                p["K_q8"] = K_q8
+                p["N_q8"] = N_q8
+                instrs.append((_CT_MATMUL_Q8, nid, p))
+
+            elif node.op in _REDUCE_TAG:
+                axis = node.params["axis"]
+                keepdims = node.params.get("keepdims", False)
+                s = shapes[ins[0]]
+                ax = axis if axis >= 0 else len(s) + axis
+                if keepdims:
+                    out_s = s[:ax] + (1,) + s[ax+1:]
+                else:
+                    out_s = s[:ax] + s[ax+1:]
+                shapes[nid] = out_s
+                p["axis"] = ax
+                p["keepdims"] = int(keepdims)
+                instrs.append((_REDUCE_TAG[node.op], nid, p))
+
+            elif node.op == Op.ARGMAX:
+                axis = node.params["axis"]
+                s = shapes[ins[0]]
+                ax = axis if axis >= 0 else len(s) + axis
+                out_s = s[:ax] + s[ax+1:]
+                shapes[nid] = out_s if out_s else (1,)
+                p["axis"] = ax
+                instrs.append((_CT_ARGMAX, nid, p))
+
+            elif node.op == Op.RESHAPE:
+                target = node.params["shape"]
+                shapes[nid] = tuple(target)
+                p["out_shape"] = tuple(target)
+                instrs.append((_CT_RESHAPE, nid, p))
+
+            elif node.op == Op.TRANSPOSE:
+                axes_perm = node.params["axes"]
+                s = shapes[ins[0]]
+                out_s = tuple(s[a] for a in axes_perm)
+                shapes[nid] = out_s
+                p["axes"] = axes_perm
+                instrs.append((_CT_TRANSPOSE, nid, p))
+
+            elif node.op == Op.CONCAT:
+                axis = node.params["axis"]
+                ss = [shapes[i] for i in ins]
+                ax = axis if axis >= 0 else len(ss[0]) + axis
+                total_ax = sum(s[ax] for s in ss)
+                out_s = list(ss[0])
+                out_s[ax] = total_ax
+                shapes[nid] = tuple(out_s)
+                p["axis"] = ax
+                p["concat_inputs"] = list(ins)
+                instrs.append((_CT_CONCAT, nid, p))
+
+            elif node.op == Op.REPEAT:
+                repeats = node.params["repeats"]
+                axis = node.params["axis"]
+                s = list(shapes[ins[0]])
+                s[axis] *= repeats
+                shapes[nid] = tuple(s)
+                p["repeats"] = repeats
+                p["axis"] = axis
+                instrs.append((_CT_REPEAT, nid, p))
+
+            elif node.op == Op.SLICE:
+                slices = node.params["slices"]
+                s_in = shapes[ins[0]]
+                out_dims = []
+                slice_starts = []
+                slice_steps = []
+                # Track which dims are "full" (slice(None)) — use 0 sentinel
+                is_full_dim = []
+                for d, sl in enumerate(slices):
+                    if isinstance(sl, slice):
+                        start = sl.start or 0
+                        stop = sl.stop if sl.stop is not None else s_in[d]
+                        step = sl.step or 1
+                        if start < 0:
+                            start += s_in[d]
+                        if stop < 0:
+                            stop += s_in[d]
+                        dim_size = max(0, (stop - start + step - 1) // step) if step > 0 else 0
+                        out_dims.append(dim_size)
+                        slice_starts.append(start)
+                        slice_steps.append(step)
+                        # Mark as full if it covers the whole dimension
+                        is_full_dim.append(
+                            sl.start is None and sl.stop is None and (sl.step is None or sl.step == 1))
+                    elif isinstance(sl, int):
+                        idx = sl if sl >= 0 else sl + s_in[d]
+                        slice_starts.append(idx)
+                        slice_steps.append(1)
+                        out_dims.append(1)
+                        is_full_dim.append(False)
+                    else:
+                        out_dims.append(s_in[d])
+                        slice_starts.append(0)
+                        slice_steps.append(1)
+                        is_full_dim.append(True)
+                # Detect integer-indexed dims to squeeze
+                squeeze_dims = []
+                for d, sl in enumerate(slices):
+                    if isinstance(sl, int):
+                        squeeze_dims.append(d)
+                final_shape = [out_dims[d] for d in range(len(out_dims))
+                               if d not in squeeze_dims]
+                if not final_shape:
+                    final_shape = [1]
+                shapes[nid] = tuple(final_shape)
+                p["starts"] = slice_starts
+                p["steps"] = slice_steps
+                # Use 0 sentinel for full-dimension slices (dynamic at runtime)
+                p["slice_out_shape"] = [
+                    0 if is_full_dim[d] else out_dims[d]
+                    for d in range(len(out_dims))
+                ]
+                instrs.append((_CT_SLICE, nid, p))
+
+            elif node.op == Op.EXPAND_DIMS:
+                axis = node.params["axis"]
+                s = shapes[ins[0]]
+                out_s = s[:axis] + (1,) + s[axis:]
+                shapes[nid] = out_s
+                instrs.append((_CT_COPY, nid, p))
+
+            elif node.op == Op.CAST:
+                shapes[nid] = shapes[ins[0]]
+                instrs.append((_CT_COPY, nid, p))
+
+            else:
+                raise ValueError(f"CTapeRunner: unknown op {node.op}")
+
+        # Phase 2: Create C TapeCtx
+        ctx = self._lib.tape_ctx_create(n_slots, len(instrs))
+        self._ctx = ctx
+        self._shapes = shapes
+        self._input_ids = input_ids
+        self._n_slots = n_slots
+        self._slot_data = slot_data  # keep refs alive for GC
+
+        # Allocate slots
+        for nid in range(n_slots):
+            node = nodes[nid]
+            s = shapes.get(nid)
+            if s is None:
+                continue
+            shape_arr = _int_arr(s)
+            ndim = len(s)
+            if nid in const_ids:
+                # Point at existing numpy data
+                arr = slot_data[nid]
+                if arr.dtype == np.float32:
+                    self._lib.tape_slot_set_external(
+                        ctx, nid,
+                        arr.ctypes.data_as(_FP),
+                        shape_arr, ndim)
+                elif arr.dtype == np.int8:
+                    # int8 slots: allocate dummy f32 slot (not used as f32)
+                    self._lib.tape_slot_alloc(ctx, nid, shape_arr, ndim)
+                else:
+                    arr_f32 = np.ascontiguousarray(arr, dtype=np.float32)
+                    slot_data[nid] = arr_f32
+                    self._lib.tape_slot_set_external(
+                        ctx, nid,
+                        arr_f32.ctypes.data_as(_FP),
+                        shape_arr, ndim)
+            elif nid in [i for i in input_ids]:
+                self._lib.tape_slot_alloc(ctx, nid, shape_arr, ndim)
+            else:
+                # Intermediate — allocate
+                self._lib.tape_slot_alloc(ctx, nid, shape_arr, ndim)
+
+        # Phase 3: Fill tape instructions
+        for idx, (tag, out_slot, p) in enumerate(instrs):
+            iptr = self._lib.tape_get_instr(ctx, idx)
+            instr = ctypes.cast(iptr, ctypes.POINTER(_TapeInstrFields)).contents
+            instr.tag = tag
+            instr.out_slot = out_slot
+            instr.in0 = p.get("in0", -1)
+            instr.in1 = p.get("in1", -1)
+            instr.in2 = p.get("in2", -1)
+            instr.axis = p.get("axis", 0)
+            instr.keepdims = p.get("keepdims", 0)
+            instr.repeats = p.get("repeats", 0)
+
+            # out_shape for binops
+            if "out_shape" in p:
+                os = p["out_shape"]
+                for d in range(len(os)):
+                    instr.out_shape[d] = os[d]
+                instr.out_ndim = len(os)
+                sz = 1
+                for d in os:
+                    sz *= d
+                instr.out_size = sz
+
+            # MATMUL_Q8 pointers
+            if tag == _CT_MATMUL_Q8:
+                instr.wq8_ptr = p["wq8_ptr"]
+                instr.scales_ptr = p["scales_ptr"]
+                instr.K_q8 = p["K_q8"]
+                instr.N_q8 = p["N_q8"]
+
+            # Transpose axes
+            if "axes" in p:
+                for d, a in enumerate(p["axes"]):
+                    instr.axes[d] = a
+
+            # Slice params
+            if "starts" in p:
+                for d in range(len(p["starts"])):
+                    instr.starts[d] = p["starts"][d]
+                    instr.steps[d] = p["steps"][d]
+                sos = p["slice_out_shape"]
+                for d in range(len(sos)):
+                    instr.slice_out_shape[d] = sos[d]
+                instr.slice_out_ndim = len(sos)
+
+            # Concat inputs
+            if "concat_inputs" in p:
+                ci = p["concat_inputs"]
+                for d in range(len(ci)):
+                    instr.concat_inputs[d] = ci[d]
+                instr.concat_n_inputs = len(ci)
+
+    def run(self, inputs: dict[int, np.ndarray]) -> dict[int, np.ndarray]:
+        """Execute the tape in C. Returns dict[nid → array]."""
+        lib = self._lib
+        ctx = self._ctx
+
+        # Seed INPUT slots
+        for nid in self._input_ids:
+            arr = np.ascontiguousarray(inputs[nid], dtype=np.float32)
+            shape_arr = _int_arr(arr.shape)
+            # Write data first (handles reallocation if size grew)
+            lib.tape_slot_write(ctx, nid,
+                                arr.ctypes.data_as(_FP),
+                                arr.size)
+            # Then update shape metadata
+            lib.tape_slot_set_shape(ctx, nid, shape_arr, len(arr.shape))
+
+        # One C call executes entire tape
+        lib.tape_run(ctx)
+
+        return self
+
+    def get_value(self, nid: int) -> np.ndarray:
+        """Read a slot's data as numpy array."""
+        out_size = ctypes.c_int(0)
+        ptr = self._lib.tape_slot_read(self._ctx, nid,
+                                        ctypes.byref(out_size))
+        # Read actual shape from C slot (handles dynamic KV cache growth)
+        shape_buf = (ctypes.c_int * 8)()
+        ndim = self._lib.tape_slot_read_shape(self._ctx, nid, shape_buf)
+        s = tuple(shape_buf[d] for d in range(ndim))
+        return np.ctypeslib.as_array(ptr, shape=(out_size.value,)).reshape(s).copy()
+
+    def __del__(self):
+        if hasattr(self, '_ctx') and self._ctx:
+            self._lib.tape_ctx_destroy(self._ctx)
+            self._ctx = None
+
+
+# ---------------------------------------------------------------
 # Main evaluator
 # ---------------------------------------------------------------
 
@@ -609,12 +1179,23 @@ def evaluate_c(graph: CircuitGraph,
             values[nid] = x * x
 
         elif node.op == Op.MATMUL:
-            # Use np.matmul — it links to BLAS (Accelerate/MKL/OpenBLAS)
-            # with optimized dispatch, avoiding the ctypes overhead of
-            # calling our C wrapper per matmul.
             a = np.ascontiguousarray(inp[0], dtype=np.float32)
             b = np.ascontiguousarray(inp[1], dtype=np.float32)
             values[nid] = np.matmul(a, b)
+
+        elif node.op == Op.MATMUL_Q8:
+            x = np.ascontiguousarray(inp[0], dtype=np.float32)
+            wq8 = np.ascontiguousarray(inp[1], dtype=np.int8)
+            scales = np.ascontiguousarray(inp[2], dtype=np.float32)
+            M, K = x.shape[-2] if x.ndim >= 2 else 1, x.shape[-1]
+            N = wq8.shape[-1]
+            out = np.empty((M, N), dtype=np.float32)
+            lib.ceval_matmul_q8(
+                _to_c_float(out),
+                _to_c_float(x.reshape(M, K)), M, K,
+                _to_c_int8(wq8), N,
+                _to_c_float(scales))
+            values[nid] = out
 
         elif node.op in (Op.SUM, Op.MAX_REDUCE, Op.MEAN):
             x = np.asarray(inp[0], dtype=np.float32)

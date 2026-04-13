@@ -43,7 +43,7 @@ from kllm.circuit_compiler import (
     compile_model,
     _build_rope_const,
 )
-from kllm.circuit_executor import evaluate_c, precompute_consts, ExecutionPlan
+from kllm.circuit_executor import evaluate_c, precompute_consts, ExecutionPlan, CTapeRunner
 from kllm.circuit_graph import CircuitGraph
 
 
@@ -68,9 +68,9 @@ class JitSession:
         # Pre-cache all CONST values so evaluate_c skips them each step.
         self._const_cache = precompute_consts(self._machine.graph)
 
-        # Pre-compile the execution plan — instruction tape with
-        # pre-resolved function pointers, pre-extracted params,
-        # CONST values pre-seeded.  run() just executes the tape.
+        # C tape runner built lazily on first decode_step (needs real input shapes).
+        self._c_runner = None
+        # Fallback Python tape interpreter.
         self._plan = ExecutionPlan(self._machine.graph, self._const_cache)
 
         # Precomputed RoPE table (all positions up to max_seq)
@@ -144,19 +144,35 @@ class JitSession:
             inputs[m.input_ids[f"L{li}/cache_k"]] = k_cache
             inputs[m.input_ids[f"L{li}/cache_v"]] = v_cache
 
-        # Run the machine — pre-compiled instruction tape
-        values = self._plan.run(inputs)
+        # Run the machine — C tape runner or Python fallback
+        # Build C runner lazily on first call (needs real input shapes).
+        if self._c_runner is None and self._plan is not None:
+            try:
+                self._c_runner = CTapeRunner(
+                    self._machine.graph, self._const_cache,
+                    sample_inputs=inputs)
+            except Exception:
+                pass  # fall back to Python plan
 
-        # Extract outputs (values is a list indexed by node ID)
-        logits = values[m.logits_id]
-
-        # Update KV cache — new_k/new_v include the concat of old + new
-        for li in range(self.num_layers):
-            new_k_id, new_v_id = m.kv_ids[li]
-            self.kv_cache[li] = (
-                np.asarray(values[new_k_id]),
-                np.asarray(values[new_v_id]),
-            )
+        if self._c_runner is not None:
+            self._c_runner.run(inputs)
+            logits = self._c_runner.get_value(m.logits_id)
+            # Update KV cache
+            for li in range(self.num_layers):
+                new_k_id, new_v_id = m.kv_ids[li]
+                self.kv_cache[li] = (
+                    self._c_runner.get_value(new_k_id),
+                    self._c_runner.get_value(new_v_id),
+                )
+        else:
+            values = self._plan.run(inputs)
+            logits = values[m.logits_id]
+            for li in range(self.num_layers):
+                new_k_id, new_v_id = m.kv_ids[li]
+                self.kv_cache[li] = (
+                    np.asarray(values[new_k_id]),
+                    np.asarray(values[new_v_id]),
+                )
 
         self.position += 1
         self.token_history.append(token_id)

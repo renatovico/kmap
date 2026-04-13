@@ -13,6 +13,7 @@ layout (``config.json``, ``embed_tokens.npy``, ``layer_<n>/``).
 import json
 import os
 import time
+from functools import lru_cache
 
 import numpy as np
 
@@ -131,6 +132,7 @@ class Fabric:
     # Transposed-weight cache (shared across all compile calls)
     # ------------------------------------------------------------------
 
+    @lru_cache(maxsize=None)
     def get_transposed(self, layer_idx: int, proj: str) -> np.ndarray:
         """Return ``layers[layer_idx][proj].T`` as contiguous float32.
 
@@ -138,47 +140,75 @@ class Fabric:
         ``compile_decode_template`` share the same array objects,
         avoiding duplicate multi-GB allocations.
         """
-        if not hasattr(self, "_t_cache"):
-            self._t_cache: dict[tuple[int, str], np.ndarray] = {}
-        key = (layer_idx, proj)
-        if key not in self._t_cache:
-            self._t_cache[key] = np.ascontiguousarray(
-                self.layers[layer_idx][proj].T, dtype=np.float32)
-        return self._t_cache[key]
+        return np.ascontiguousarray(
+            self.layers[layer_idx][proj].T, dtype=np.float32)
 
+    @lru_cache(maxsize=None)
     def get_fused_qkv_t(self, layer_idx: int) -> np.ndarray:
         """Return ``[Wq | Wk | Wv].T`` — fused QKV weight matrix.
 
         Shape: (hidden_size, q_dim + kv_dim + kv_dim).
         One matmul replaces three separate Q/K/V projections.
         """
-        if not hasattr(self, "_fused_cache"):
-            self._fused_cache: dict[tuple[int, str], np.ndarray] = {}
-        key = (layer_idx, "qkv")
-        if key not in self._fused_cache:
-            q_t = self.get_transposed(layer_idx, "q_proj")
-            k_t = self.get_transposed(layer_idx, "k_proj")
-            v_t = self.get_transposed(layer_idx, "v_proj")
-            # q_t: (hidden, q_dim), k_t: (hidden, kv_dim), v_t: (hidden, kv_dim)
-            self._fused_cache[key] = np.ascontiguousarray(
-                np.concatenate([q_t, k_t, v_t], axis=1))
-        return self._fused_cache[key]
+        q_t = self.get_transposed(layer_idx, "q_proj")
+        k_t = self.get_transposed(layer_idx, "k_proj")
+        v_t = self.get_transposed(layer_idx, "v_proj")
+        return np.ascontiguousarray(
+            np.concatenate([q_t, k_t, v_t], axis=1))
 
+    @lru_cache(maxsize=None)
     def get_fused_gate_up_t(self, layer_idx: int) -> np.ndarray:
         """Return ``[Wgate | Wup].T`` — fused Gate+Up weight matrix.
 
         Shape: (hidden_size, 2 * intermediate_size).
         One matmul replaces two separate gate/up projections.
         """
-        if not hasattr(self, "_fused_cache"):
-            self._fused_cache: dict[tuple[int, str], np.ndarray] = {}
-        key = (layer_idx, "gate_up")
-        if key not in self._fused_cache:
-            gate_t = self.get_transposed(layer_idx, "gate_proj")
-            up_t = self.get_transposed(layer_idx, "up_proj")
-            self._fused_cache[key] = np.ascontiguousarray(
-                np.concatenate([gate_t, up_t], axis=1))
-        return self._fused_cache[key]
+        gate_t = self.get_transposed(layer_idx, "gate_proj")
+        up_t = self.get_transposed(layer_idx, "up_proj")
+        return np.ascontiguousarray(
+            np.concatenate([gate_t, up_t], axis=1))
+
+    # ------------------------------------------------------------------
+    # INT8 quantization cache
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _quantize_per_column(w_f32: np.ndarray
+                             ) -> tuple[np.ndarray, np.ndarray]:
+        """Per-output-channel absmax quantization to int8.
+
+        Returns (w_q8, scales) where ``w_f32 ≈ w_q8.astype(f32) * scales``.
+        """
+        amax = np.abs(w_f32).max(axis=0)
+        amax = np.where(amax == 0, 1.0, amax)  # avoid div-by-zero
+        scales = (amax / 127.0).astype(np.float32)
+        w_q8 = np.clip(np.round(w_f32 / scales), -128, 127).astype(np.int8)
+        return w_q8, scales
+
+    @lru_cache(maxsize=None)
+    def get_quantized(self, layer_idx: int, proj: str
+                      ) -> tuple[np.ndarray, np.ndarray]:
+        """Return ``(W_q8, scales)`` for a single projection (transposed).
+
+        W_q8 shape: (in_features, out_features) int8
+        scales shape: (out_features,) float32
+        """
+        w_t = self.get_transposed(layer_idx, proj)
+        return self._quantize_per_column(w_t)
+
+    @lru_cache(maxsize=None)
+    def get_quantized_fused_qkv(self, layer_idx: int
+                                ) -> tuple[np.ndarray, np.ndarray]:
+        """Return ``(W_q8, scales)`` for fused QKV (transposed)."""
+        w_t = self.get_fused_qkv_t(layer_idx)
+        return self._quantize_per_column(w_t)
+
+    @lru_cache(maxsize=None)
+    def get_quantized_fused_gate_up(self, layer_idx: int
+                                    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return ``(W_q8, scales)`` for fused GateUp (transposed)."""
+        w_t = self.get_fused_gate_up_t(layer_idx)
+        return self._quantize_per_column(w_t)
 
     # ------------------------------------------------------------------
     # Class method: download from HuggingFace and cache

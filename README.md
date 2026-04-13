@@ -1,74 +1,95 @@
 # kllm
 
-**Boolean Logic Synthesis for LLM Inference.**
+**Compile a transformer into a gate circuit.  Optimise it.  Run it.**
 
-kllm uses the Z3 SMT solver to **compile** a transformer model into
-boolean circuits.  Every float32 weight and every activation function
-(SiLU, exp, rsqrt) is decomposed into byte-level lookup tables that
-Z3 proves correct.  At inference time, the entire pipeline runs on
-**pure NumPy** — no torch, no FPU instructions — using only shift, XOR,
-and array indexing.  The result is **bit-exact** to HuggingFace output.
+kllm turns every operation in an LLM — weights, activations, matmul,
+normalization, softmax, attention — into a **boolean gate circuit** that
+the Z3 SMT solver proves correct.  The goal is a system where:
 
-This is not quantization.  No precision is lost.  Every bit of every
-original float32 weight is preserved through a change of
-**representation**, not a change of value.
+1. The entire inference pass is one large, composable gate graph.
+2. An offline + online (JIT) optimiser **minimises gate count** before
+   and during token generation.
+3. The gate graph maps directly to FPGA LUT primitives — no FPU needed.
+
+The result is **bit-exact** to HuggingFace output.  This is not
+quantisation — no precision is lost.  Every bit of every original
+float32 weight is preserved through a change of **representation**,
+not a change of value.
 
 ## The core idea
 
-A 32-bit float is 4 bytes.  Each byte can only take one of 256 values.
-Z3 can prove, for every possible byte value, a constant gate of the form:
+### Byte-plane decomposition
+
+A 32-bit float is 4 bytes.  Each byte takes one of 256 values.  Z3
+proves, for every possible byte value, a constant gate:
 
 $$\text{target} = (0\text{xFF} \ll s_1) \oplus \text{mask}$$
 
-where $s_1 \in [0, 7]$ and $\text{mask} \in [0, 255]$.  This yields two
-256-entry lookup tables (one for shifts, one for masks) that reconstruct
-**any** byte via a single shift and a single XOR.
+where $s_1 \in [0, 7]$ and $\text{mask} \in [0, 255]$.  Two 256-entry
+LUTs (shifts + masks) reconstruct **any** byte via one shift and one
+XOR.  Four planes reconstruct the full float32 — lossless.
 
-**Weights** are stored as 4 byte-plane indices per float32.  At load time,
-the gate LUTs execute `(0xFF << s1_lut[b]) ^ mask_lut[b]` for each byte
-and reassemble the original float32 — lossless, no floating-point math.
+### Everything is a circuit
 
-**Activation functions** (SiLU, exp, rsqrt) use the same principle but
-scaled to the entire float32 domain: for every one of the $2^{32}$
-possible input bit patterns, the output is pre-computed and stored as
-4 byte-plane files (~4 GB each).  At runtime, activations are a single
-array index into a memory-mapped file — O(1) per value.
+The key insight is that this gate decomposition generalises beyond
+weights and activation functions to **every arithmetic operation** in
+the transformer:
 
-### Why this works
+| Operation | Gate circuit |
+|---|---|
+| **Weight storage** | 4 byte-plane constant gates per float32 |
+| **Activation fns** (SiLU, exp, rsqrt) | Full-domain ($2^{32}$) byte-plane mmap LUTs |
+| **Matrix multiply** | Grid of binary multiply gates + add-reduction tree |
+| **RMSNorm** | Square gates → sum reduction → rsqrt circuit → scale |
+| **Softmax** | Max reduction → subtract → exp circuit → sum → divide |
+| **RoPE** | Precomputed cos/sin constant gates → multiply gates |
+| **Residual connections** | Ripple-carry add gates on byte planes |
+| **Attention scores** | Matmul circuit → scale gate → causal mask → softmax circuit |
 
-| Concept | Traditional approach | kllm |
-|---|---|---|
-| Weight storage | float32 tensors in VRAM | 4 byte-plane indices → gate LUT → float32 |
-| Activation fns | FPU (SiLU, exp, rsqrt) | Full-domain byte-plane maps (mmap lookup) |
-| Data path | float32 arithmetic | shift + XOR + array index |
-| Precision | Lossy if quantised | **Lossless** — bit-exact to HuggingFace |
-| Runtime deps | torch, transformers, CUDA | **numpy only** |
+Each layer is a **subgraph** of gate nodes.  The full model is a
+composition of layer subgraphs into a single directed acyclic graph
+(DAG).
 
-### Three compilation stages
+### Two-phase optimisation
 
-1. **Weight compilation** (`kllm --mode compile`) — loads HuggingFace
-   weights, decomposes every float32 into 4 IEEE-754 byte planes, and
-   runs Z3 to prove a `(shift, mask)` gate for all 256 byte values.
-   Result: `.npz` gate arrays per layer.
+**Offline (compile time)** — weights and model structure are known:
 
-2. **Circuit compilation** (`kllm --mode compile-circuits`) — evaluates
-   SiLU, exp, and rsqrt for **all $2^{32}$ float32 bit patterns**.
-   Each output is split into 4 byte planes and written as ~4 GB binary
-   files (12 files, ~48 GB total).  Memory-mapped at runtime — the OS
-   pages in only what the model touches.
+- **Constant folding**: weight bytes are constants → fold into gates,
+  eliminate intermediate nodes.
+- **Dead gate elimination**: prune gates whose outputs are unused.
+- **Gate merging**: cascaded shift+XOR collapses into a single gate.
+- **Subgraph dedup**: identical attention heads share a single circuit.
+- **Quine-McCluskey minimisation**: 8-variable boolean functions →
+  minimal sum-of-products representation.
 
-3. **Optimisation** (`kllm --mode optimize`) — applies Quine-McCluskey
-   boolean minimisation to the gate LUTs (8 inputs → 8 outputs) and
-   materialises pre-computed float32 weight files for instant mmap
-   loading, bypassing gate execution entirely.
+**Online (per-token JIT)** — KV cache values become known after each
+decode step:
+
+- Fold cached K/V values as constants into the attention circuit.
+- Constant-propagate through softmax (known key magnitudes simplify
+  max/sum reductions).
+- Re-minimise the specialised circuit and cache it — same prefix
+  reuses the same optimised circuit.
+- Amortise: optimisation cost must be less than gate savings over
+  subsequent tokens.
+
+This is analogous to a JIT compiler: token 1 runs the full circuit;
+token 2+ runs a progressively more specialised (smaller) circuit.
+
+### FPGA as the target
+
+Gate circuits map directly to FPGA lookup-table primitives.  The
+optimised DAG can be exported to Verilog/VHDL for synthesis.  Every
+gate in the graph is a proven-correct truth table — the Z3 proofs
+become the testbench.
 
 ### Why full-domain?
 
-Pre-computing every possible float32 input means no value is ever
-"unseen".  Every prompt, every temperature, every token produces
-activation values that already exist in the compiled tables.  There is
-no hash table, no on-demand compilation, no fallback — just a single
-array index per value.
+Pre-computing every possible float32 input ($2^{32}$ values) means no
+value is ever "unseen".  Every prompt, every temperature, every token
+produces activation values that already exist in the compiled tables.
+No hash table, no on-demand compilation, no fallback — a single array
+index per value.
 
 ## Installation
 
@@ -140,23 +161,18 @@ src/kllm/
 ├── ops_compiler.py   # Full-domain activation circuit compilation
 ├── optimizer.py      # Quine-McCluskey boolean minimisation + weight materialisation
 ├── circuits.py       # Z3 gate primitives + ArithmeticUnit (mmap byte planes)
-├── circuit_model.py  # LLaMA transformer with Z3 circuit execution + streaming
+├── circuit_model.py  # LLaMA transformer with circuit execution + streaming
 ├── fabric.py         # Gate loader — shift+XOR → float32 weight matrices
 ├── model.py          # Reference NumPy LLaMA (used by compare)
 ├── inference.py      # Orchestrator: tokenizer + fabric + circuits → generate
 ├── tokenizer.py      # Pure-Python BPE tokenizer (no HuggingFace)
 ├── compare.py        # HuggingFace vs kllm generation comparison
 ├── device.py         # GPU / CPU abstraction (CuPy ↔ NumPy)
-└── cli.py            # CLI entry point
-tests/
-├── test_bitops.py
-├── test_circuits.py
-├── test_cli.py
-├── test_compare.py
-├── test_compiler.py
-├── test_device.py
-├── test_optimizer.py
-└── test_tokenizer.py
+├── cli.py            # CLI entry point
+├── binary_ops.py     # (planned) Byte-plane arithmetic: add, mul, div, max
+├── circuit_graph.py  # (planned) DAG of gate nodes — full-model circuit
+├── jit_optimizer.py  # (planned) Per-token circuit specialisation
+└── hdl_export.py     # (planned) Gate graph → Verilog / VHDL
 ```
 
 ## Running tests
@@ -165,55 +181,23 @@ tests/
 pytest          # 68 tests
 ```
 
-## How it works
+## Current status
 
-```
- ┌──────────────────────────────────────────────────────────┐
- │                    COMPILE TIME (one-time)                │
- └──────────────────────────────────────────────────────────┘
+The project implements **Phase 1** (weights + activations as circuits)
+with a working inference pipeline.  See [PLAN.md](PLAN.md) for the
+full roadmap toward the complete gate-circuit architecture.
 
-  HuggingFace weights        Z3 Solver              Disk
-  ───────────────────        ─────────              ────
-  float32 per weight  ──▶  .view(uint32)  ──▶  4 byte planes (m0-m3)
-                           Z3: (0xFF << s1) ^ mask == target
-                           ──▶ 256-entry (s1, mask) LUTs
-                           ──▶ layer_N.npz  (gate fabric)
-
-  SiLU / exp / rsqrt        NumPy eval              Disk
-  ──────────────────        ──────────              ────
-  for all 2^32 inputs ──▶  fn(x) → 4 bytes  ──▶  {op}_p{0-3}.bin
-                            (one per byte plane)    (4 GB each, 12 files)
-
- ┌──────────────────────────────────────────────────────────┐
- │               INFERENCE (numpy only, no torch)           │
- └──────────────────────────────────────────────────────────┘
-
-  ┌─────────────┐
-  │   Fabric    │  Three load paths:
-  │  (weights)  │  1. gate LUTs: shift+XOR → float32 (default)
-  │             │  2. optimized/: pre-computed float32 mmap (fast)
-  └──────┬──────┘
-         │
-         ▼
-  ┌─────────────┐
-  │  Circuits   │  Activation functions:
-  │ (SiLU, exp, │  Z3-verified NumPy formulas (SIMD, fast path)
-  │   rsqrt)    │  — or mmap byte-plane files (full-domain fallback)
-  └──────┬──────┘
-         │
-         ▼
-  ┌─────────────┐
-  │ Transformer │  RMSNorm → Q,K,V → RoPE → Attention → MLP
-  │  (per layer)│  matmul on reconstructed float32 weights
-  │             │  activations via circuit lookup
-  └──────┬──────┘
-         │
-         ▼
-  ┌─────────────┐
-  │  KV-cached  │  prefill full prompt, then O(1) per decode token
-  │  generation │  streaming: yields each token as produced
-  └─────────────┘
-```
+| Component | Status |
+|---|---|
+| Weight gate compilation (Z3) | ✅ Complete |
+| Activation circuits (SiLU, exp, rsqrt) | ✅ Full-domain mmap |
+| Quine-McCluskey gate minimisation | ✅ 8-variable |
+| Pure-NumPy inference (no torch) | ✅ Bit-exact |
+| Binary arithmetic circuits (add, mul) | 🔲 Planned |
+| Circuit graph DAG (full model) | 🔲 Planned |
+| Offline graph optimisation | 🔲 Planned |
+| Online JIT per-token optimisation | 🔲 Planned |
+| FPGA export (Verilog/VHDL) | 🔲 Planned |
 
 ## Compiled output layout
 

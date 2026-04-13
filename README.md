@@ -173,6 +173,7 @@ src/kllm/
 ├── circuit_graph.py  # DAG of gate nodes — circuit builder + reference evaluator
 ├── circuit_compiler.py # Compile LLaMA transformer into a CircuitGraph
 ├── circuit_executor.py # C-accelerated graph evaluator (ctypes wrapper)
+├── graph_optimizer.py # DAG-level constant folding + dead elimination
 ├── jit_optimizer.py  # (planned) Per-token circuit specialisation
 └── hdl_export.py     # (planned) Gate graph → Verilog / VHDL
 
@@ -183,7 +184,7 @@ csrc/
 ## Running tests
 
 ```bash
-pytest          # 184 tests
+pytest          # 207 tests
 ```
 
 ## Current status
@@ -203,7 +204,7 @@ full roadmap toward the complete gate-circuit architecture.
 | cos/sin activation LUTs + float64 support | 🔲 Phase 2 (cos/sin compile pending) |
 | Transformer → circuit graph compilation | ✅ Phase 3 |
 | C gate executor (zero NumPy runtime) | ✅ Phase 4 |
-| Offline graph optimisation | 🔲 Phase 5 |
+| Offline graph optimisation | ✅ Phase 5 |
 | Online JIT per-token optimisation | 🔲 Phase 6 |
 | FPGA export (Verilog/VHDL) | 🔲 Phase 7 |
 

@@ -346,26 +346,39 @@ pytest tests/test_c_executor.py  # 38 passed
 
 ---
 
-## Phase 5 — Offline optimisation
+## Phase 5 — Offline optimisation  ✅ DONE
 
 **Goal**: minimise gate count at compile time.  Weights and model
 structure are fully known.
 
-### Extensions to `optimizer.py`
+### Implementation: `graph_optimizer.py`
 
-| Optimisation | Description |
+Graph-level DAG optimizations (distinct from `optimizer.py` QMC byte-level):
+
+| Pass | Description |
 |---|---|
-| **Constant folding** | Weight bytes are known → fold into gate nodes |
-| **Dead gate elimination** | Remove nodes with no downstream consumers |
-| **Gate merging** | Cascaded shift+XOR → single equivalent gate |
-| **Subgraph dedup** | Identical attention heads share one subgraph |
-| **RoPE const folding** | All trig values are position-only → fold into multiply gates |
-| **QMC at boundaries** | Quine-McCluskey at subgraph I/O (8-variable blocks) |
+| **Identity elimination** | Remove trivial ops: add(x,0), mul(x,1), neg(neg(x)), sub(x,0), div(x,1) |
+| **Constant folding** | Evaluate nodes with all-constant inputs, replace chains with CONST |
+| **Dead node elimination** | Remove nodes not reachable from outputs, renumber contiguously |
+
+**Key result**: A compiled model graph (all fixed token_ids, all weights
+are constants) folds completely to a **single CONST node** — the
+precomputed logits tensor.  84 nodes → 1 node for a 1-layer test model.
+
+For graphs with INPUT nodes (dynamic token_ids), only the constant
+subgraph folds — the input-dependent compute structure is preserved.
+
+```python
+from kllm.graph_optimizer import optimize_graph, optimization_stats
+opt_graph, id_map = optimize_graph(graph, output_ids=[logits_id])
+stats = optimization_stats(graph, opt_graph)
+# stats["gate_reduction_pct"] == 100.0 for all-const graphs
+```
 
 ### Verification
 
 ```bash
-pytest tests/test_optimizer.py
+pytest tests/test_graph_optimizer.py  # 23 passed
 # Optimised graph == unoptimised output, fewer gates
 ```
 

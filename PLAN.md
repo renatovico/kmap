@@ -148,33 +148,73 @@ What exists today.
 
 ---
 
-## Phase 2 — Binary arithmetic circuits + missing activations
+## Phase 2 — Circuit graph + reference ops + missing activations ✅ (done)
 
-**Goal**: implement every IEEE-754 arithmetic operation as a gate
-circuit on byte planes, plus compile the missing activation functions
-(cos, sin), so no float operation remains.
+**Goal**: define the circuit DAG representation, provide reference
+implementations for every IEEE-754 operation, and compile missing
+activation functions (cos, sin).
 
-### New module: `binary_ops.py`
+### Architecture correction
 
-| Function | Gate strategy |
+The original plan tried to implement IEEE-754 arithmetic in Python
+using integer bit operations (shift, XOR, mask on uint32).  This was
+wrong — it was a hypothetical "how to run" that:
+
+1. Was fragile and incomplete (edge cases, rounding, denormals).
+2. Was the **executor's** job, not the graph's.
+3. Added no value — NumPy already IS the reference FPU.
+
+The correct separation is:
+- **`circuit_graph.py`** — DAG of gate nodes (WHAT to compute)
+- **`binary_ops.py`** — reference implementation (NumPy golden model)
+- **C gate executor** (Phase 4) — actual byte-plane execution (HOW to run)
+
+### New module: `circuit_graph.py`
+
+The core data structure.  Every operation is a node in the DAG:
+
+| Node kind | Maps to | Gates? |
+|---|---|---|
+| `const` | Weight bytes, RoPE freqs, causal -inf | 0 |
+| `input` | Token IDs, position indices | 0 |
+| `lut` | SiLU, exp, rsqrt, cos, sin | 0 (LUT lookup) |
+| `add/sub/mul/div` | IEEE-754 float32 arithmetic | Yes |
+| `neg/abs` | Sign-bit manipulation | 1 gate |
+| `max/cmp_le/mux` | Comparison and selection | Yes |
+| `matmul` | Matrix multiply | Grid of mul+sum |
+| `sum/max_reduce/argmax/mean` | Reductions | Tree of binary gates |
+| `reshape/transpose/concat/repeat/slice` | Wire routing | 0 |
+| `cast` | Type conversion | 0 |
+
+Composite subgraphs: `softmax()`, `rms_norm()` decompose into
+primitive nodes automatically.
+
+Reference evaluator: `evaluate(graph, inputs)` walks the DAG in
+topological order using NumPy — produces the golden output that the
+C executor must match bit-for-bit.
+
+### Module: `binary_ops.py` (reference)
+
+| Function | What it does |
 |---|---|
-| `circuit_add(a, b)` | Ripple-carry adder across 4 byte planes (uint8 carry chain) |
-| `circuit_sub(a, b)` | Negate b (flip sign bit) + `circuit_add` |
-| `circuit_mul(a, b)` | Byte-plane multiply with cross-plane carry propagation |
-| `circuit_div(a, b)` | Reciprocal via rsqrt circuit + Newton-Raphson gate chain |
-| `circuit_neg(a)` | XOR sign bit (bit 31) |
-| `circuit_square(a)` | `circuit_mul(a, a)` (self-multiply) |
-| `circuit_max(a, b)` | IEEE-754 sign-magnitude comparison gate (uint32 ordering trick) |
-| `circuit_cmp_le(a, b)` | IEEE-754 magnitude compare → 0 or 1 output bit |
-| `circuit_mux(sel, a, b)` | If sel=0 return a, else b (single LUT gate) |
-| `circuit_sum(arr)` | Binary reduction tree of `circuit_add` |
-| `circuit_argmax(arr)` | `circuit_max` reduction tree, tracking winning index |
+| `circuit_add(a, b)` | NumPy float32 addition (reference for executor) |
+| `circuit_sub(a, b)` | NumPy float32 subtraction |
+| `circuit_mul(a, b)` | NumPy float32 multiplication |
+| `circuit_div(a, b)` | NumPy float32 division |
+| `circuit_neg(a)` | XOR sign bit (real bit op) |
+| `circuit_abs(a)` | AND clear sign bit (real bit op) |
+| `circuit_max(a, b)` | `np.maximum` (reference) |
+| `circuit_cmp_le(a, b)` | `a <= b` → uint8 (reference) |
+| `circuit_mux(sel, a, b)` | `np.where` selection (reference) |
+| `circuit_sum(arr)` | `np.sum` (reference) |
+| `circuit_argmax(arr)` | `np.argmax` (reference) |
+| `circuit_matmul(a, b)` | `a @ b` (reference) |
+| `circuit_softmax(x)` | max → sub → exp → sum → div (reference) |
 
 ### Float64 support (8 byte planes)
 
-RMSNorm variance requires float64 precision.  Extend all binary ops
-to 8-byte-plane gates (same shift+XOR strategy, double the planes).
-Z3 proves correctness for uint8 LUTs on all 8 planes.
+RMSNorm variance requires float64 precision.  Float64 reference ops
+provided (`circuit_add_f64`, etc.).  C executor will use 8 byte planes.
 
 ### New activation circuits
 
@@ -194,55 +234,49 @@ as constant gate arrays.
 ### Verification
 
 ```bash
-pytest tests/test_binary_ops.py
-# circuit_add(a,b) == np.float32(a+b) for 10k random pairs
-# circuit_mul(a,b) == np.float32(a*b) for 10k random pairs
-# circuit_argmax matches np.argmax
-# float64 ops match for 10k random pairs
-# cos/sin LUTs match np.cos/np.sin for all 2^32 inputs
+pytest tests/test_binary_ops.py      # 24 tests — reference ops
+pytest tests/test_circuit_graph.py   # 35 tests — DAG + evaluator
+# binary_ops: bit-exact to NumPy for all operations
+# circuit_graph: graph construction, topological order, gate counting
+# evaluator: arithmetic, comparison, reduction, wiring, LUT, composite
 ```
 
 ---
 
-## Phase 3 — Circuit graph representation
+## Phase 3 — Transformer → circuit graph compilation ✅ (done)
 
-**Goal**: represent the entire transformer forward pass as a single
-composable DAG of gate nodes.  Every operation from the audit — both
-arithmetic and structural — has a node type.
+**Goal**: compile the full `circuit_model.py` transformer into a
+`CircuitGraph` DAG.  The graph structure was built in Phase 2;
+this phase populates it with the actual model.
 
-### New module: `circuit_graph.py`
+> `circuit_graph.py` (Phase 2) already has:
+> - `CircuitGraph` with all node types (const, add, mul, matmul, lut, etc.)
+> - `evaluate()` reference evaluator (NumPy golden model)
+> - Composite subgraphs: `softmax()`, `rms_norm()`
+> - Topological ordering, gate counting
+> - `keepdims` support on reductions, `expand_dims` node
 
-```python
-class GateNode:
-    """Single node in the circuit DAG."""
-    kind: str           # "const", "unary_lut", "binary", "mux",
-                        # "wire", "memory", "reduce"
-    inputs: list[int]   # indices of input nodes
-    params: dict        # shift, mask, lut, etc.
+### New module: `circuit_compiler.py`
 
-class CircuitGraph:
-    """DAG of gate nodes with topological ordering."""
-    nodes: list[GateNode]
-    inputs: list[int]   # graph input node indices
-    outputs: list[int]  # graph output node indices
+`compile_model(fabric, token_ids, start_pos)` walks the model and
+emits a complete `CircuitGraph`.  Every operation is a node:
 
-    def compose(self, other, op: str) -> CircuitGraph: ...
-    def evaluate(self, *inputs) -> np.ndarray: ...
-    def serialize(self, path: str) -> None: ...  # for C executor
-    def to_dot(self) -> str: ...                 # Graphviz
+- Weights → `const` nodes (transposed for matmul)
+- RoPE cos/sin → `const` nodes (precomputed)
+- Embedding → `const` node (selected rows for fixed token_ids)
+- Each layer: `rms_norm` → `attention` → `residual` → `rms_norm` → `mlp` → `residual`
+- Attention: QKV matmul → reshape → RoPE → GQA repeat → scores → causal mask → softmax → context
+- MLP: gate/up matmul → SiLU LUT → mul → down matmul
+- Final: `rms_norm` → `matmul(lm_head)` → logits
+
+### Verification
+
+```bash
+pytest tests/test_circuit_compiler.py   # 11 tests
+# Graph evaluation matches NumPy reference (single + multi token)
+# Gate count grows with layers
+# Argmax on logits produces valid token ID
 ```
-
-### Node types for every operation
-
-| Node kind | Maps to | Gates? |
-|---|---|---|
-| `"const"` | Weight bytes, RoPE freqs, causal -inf | 0 |
-| `"unary_lut"` | SiLU, exp, rsqrt, cos, sin | 0 (LUT lookup) |
-| `"binary"` | add, mul, div, sub, max, cmp | Yes |
-| `"mux"` | embed lookup, causal mask select | 1 |
-| `"wire"` | reshape, transpose, repeat, fanout | 0 |
-| `"memory"` | KV cache append | 0 |
-| `"reduce"` | sum, max, argmax over axis | Tree of binary gates |
 
 ### Transformer → circuit graph compilation
 

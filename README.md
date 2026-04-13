@@ -169,8 +169,9 @@ src/kllm/
 ├── compare.py        # HuggingFace vs kllm generation comparison
 ├── device.py         # GPU / CPU abstraction (CuPy ↔ NumPy)
 ├── cli.py            # CLI entry point
-├── binary_ops.py     # (planned) Byte-plane arithmetic: add, mul, div, max
-├── circuit_graph.py  # (planned) DAG of gate nodes — full-model circuit
+├── binary_ops.py     # IEEE-754 reference implementations (golden model for executor)
+├── circuit_graph.py  # DAG of gate nodes — circuit builder + reference evaluator
+├── circuit_compiler.py # Compile LLaMA transformer into a CircuitGraph
 ├── jit_optimizer.py  # (planned) Per-token circuit specialisation
 └── hdl_export.py     # (planned) Gate graph → Verilog / VHDL
 ```
@@ -193,9 +194,10 @@ full roadmap toward the complete gate-circuit architecture.
 | Activation circuits (SiLU, exp, rsqrt) | ✅ Full-domain mmap |
 | Quine-McCluskey gate minimisation | ✅ 8-variable |
 | Pure-NumPy inference (no torch) | ✅ Bit-exact |
-| Binary arithmetic circuits (add, mul, div, …) | 🔲 Phase 2 |
-| cos/sin activation LUTs + float64 support | 🔲 Phase 2 |
-| Circuit graph DAG (all ops as nodes) | 🔲 Phase 3 |
+| Binary arithmetic reference ops | ✅ Phase 2 |
+| Circuit graph DAG + reference evaluator | ✅ Phase 2 |
+| cos/sin activation LUTs + float64 support | 🔲 Phase 2 (cos/sin compile pending) |
+| Transformer → circuit graph compilation | ✅ Phase 3 |
 | C gate executor (zero NumPy runtime) | 🔲 Phase 4 |
 | Offline graph optimisation | 🔲 Phase 5 |
 | Online JIT per-token optimisation | 🔲 Phase 6 |

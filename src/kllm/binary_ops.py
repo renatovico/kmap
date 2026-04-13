@@ -169,10 +169,10 @@ def circuit_matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 def circuit_softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
     """Softmax: max -> sub -> exp -> sum -> div."""
-    from kllm.circuits import _exp_fn
     x = np.asarray(x, dtype=np.float32)
     m = x.max(axis=axis, keepdims=True)
-    e = _exp_fn(x - m)
+    with np.errstate(over="ignore"):
+        e = np.exp((x - m).astype(np.float64)).astype(np.float32)
     return e / e.sum(axis=axis, keepdims=True)
 
 

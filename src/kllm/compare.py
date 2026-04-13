@@ -1,8 +1,8 @@
 """HuggingFace vs kllm comparison.
 
 Runs the same prompt through:
-  1. HuggingFace ``pipeline("text-generation")`` with greedy decoding
-  2. kllm ``BitLogicInferenceEngine`` — Z3-gate-backed inference
+  1. HuggingFace ``AutoModelForCausalLM`` with greedy decoding
+  2. kllm ``JitSession`` — circuit graph inference via C executor
 
 and prints a side-by-side report of generated text and timing.
 """
@@ -10,6 +10,7 @@ and prints a side-by-side report of generated text and timing.
 import os
 import time
 
+import numpy as np
 import torch
 
 
@@ -26,9 +27,6 @@ def compare_generate(
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     # ---- HuggingFace (manual greedy decode) ----
-    # Use float32 + eager attention to match kllm's exact numerical
-    # path.  The pipeline API defaults to bfloat16 + SDPA which gives
-    # different accumulation results.
     messages = [{"role": "user", "content": text}]
     hf_tok = AutoTokenizer.from_pretrained(model_name)
     hf_model = AutoModelForCausalLM.from_pretrained(
@@ -61,29 +59,32 @@ def compare_generate(
     del hf_model
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
-    # ---- kllm engine (pure Python, no HuggingFace) ----
+    # ---- kllm engine (circuit graph + C executor) ----
+    from kllm.fabric import Fabric
+    from kllm.jit_optimizer import JitSession
     from kllm.tokenizer import Tokenizer as KllmTokenizer
 
     tok_dir = os.path.join(save_dir, "tokenizer")
     kllm_tok = KllmTokenizer(tok_dir)
-    prompt = kllm_tok.apply_chat_template(
+    token_ids = kllm_tok.apply_chat_template(
         messages, add_generation_prompt=True,
     )
 
-    from kllm.inference import BitLogicInferenceEngine
-
-    eng = BitLogicInferenceEngine(save_dir)
+    fabric = Fabric(save_dir)
+    session = JitSession(fabric)
 
     t0 = time.perf_counter()
-    kllm_full = eng.generate(prompt, max_new_tokens=max_tokens)
+    logits = session.prefill(token_ids)
+    generated: list[int] = []
+    for _ in range(max_tokens):
+        next_id = int(np.argmax(logits[-1]))
+        if next_id == kllm_tok.eos_token_id:
+            break
+        generated.append(next_id)
+        logits = session.decode_step(next_id)
     kllm_time = time.perf_counter() - t0
 
-    # generate() decodes with skip_special_tokens=True, so we must
-    # compare against the prompt decoded the same way for correct slicing.
-    prompt_decoded = kllm_tok.decode(
-        kllm_tok.encode(prompt), skip_special_tokens=True,
-    )
-    kllm_output = kllm_full[len(prompt_decoded):]
+    kllm_output = kllm_tok.decode(generated, skip_special_tokens=True)
 
     return {
         "text": text,
@@ -99,7 +100,7 @@ def print_generate_report(stats: dict) -> None:
     """Pretty-print generation comparison report."""
     w = 64
     print("\n" + "=" * w)
-    print("  kllm — HuggingFace Pipeline vs Z3 Gate Engine")
+    print("  kllm — HuggingFace vs Circuit Graph Engine")
     print("=" * w)
     print(f"  Prompt     : {stats['text']!r}")
     print(f"  Max tokens : {stats['max_tokens']}")

@@ -35,6 +35,7 @@ import hashlib
 import numpy as np
 
 from kllm.circuit_compiler import compile_model
+from kllm.circuit_executor import evaluate_c
 from kllm.circuit_graph import CircuitGraph, evaluate
 from kllm.graph_optimizer import optimize_graph, optimization_stats
 
@@ -70,7 +71,7 @@ class JitSession:
             self.fabric, token_ids, start_pos=0)
 
         # Evaluate full graph
-        values = evaluate(graph)
+        values = evaluate_c(graph)
         logits = values[logits_id]
 
         # Extract K/V cache from the graph evaluation
@@ -109,13 +110,13 @@ class JitSession:
         optimized_nodes = len(opt_graph)
 
         # Evaluate the optimized graph
-        values = evaluate(opt_graph)
+        values = evaluate_c(opt_graph)
         logits = values[id_map[logits_id]]
 
         # Extract new K/V from the unoptimized graph evaluation
         # (the optimized graph has already folded everything)
         # We need to evaluate the full graph to get K/V values
-        full_values = evaluate(graph)
+        full_values = evaluate_c(graph)
         new_kv = _extract_kv_cache(
             graph, full_values, self.num_layers, 1)
 

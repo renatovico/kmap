@@ -184,7 +184,7 @@ csrc/
 ## Running tests
 
 ```bash
-pytest          # 251 tests
+pytest          # 265 tests
 ```
 
 ## Current status
@@ -207,6 +207,7 @@ full roadmap toward the complete gate-circuit architecture.
 | Offline graph optimisation | ✅ Phase 5 |
 | Online JIT per-token optimisation | ✅ Phase 6 |
 | FPGA export (Verilog/VHDL) | ✅ Phase 7 |
+| Integration + CLI pipeline | ✅ Phase 8 |
 
 ## Compiled output layout
 

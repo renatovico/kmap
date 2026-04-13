@@ -465,7 +465,23 @@ pytest tests/test_hdl_export.py  # 27 passed
 
 ---
 
-## Phase 8 — Integration and verification
+## Phase 8 — Integration and verification ✅ DONE
+
+### Implementation
+
+- **CLI modes added**: `circuit-compile`, `circuit-optimize`, `circuit-eval`, `export-hdl`
+- **Integration test** (`test_integration.py`): 16 tests covering full pipeline
+  - compile → evaluate (reference + C)
+  - compile → optimize → evaluate (bit-exact)
+  - serialize → deserialize round-trip
+  - HDL export from compiled graph
+  - Full pipeline: compile → optimize → C eval → serialize → load → HDL
+  - argmax consistency across all evaluators
+
+```bash
+pytest tests/test_integration.py  # 16 passed
+pytest tests/               # 265 passed, 6 skipped
+```
 
 ### End-to-end invariant
 
@@ -481,10 +497,12 @@ kllm --mode compare --text "Hello world" --max-tokens 10
 |---|---|---|
 | `test_binary_ops.py` | 2 | add/mul/div/argmax match IEEE-754; float64; cos/sin LUTs |
 | `test_circuit_graph.py` | 3 | Single-layer DAG matches `circuit_model.py`; all node types |
+| `test_circuit_compiler.py` | 3 | Transformer compilation; reference forward pass |
 | `test_c_executor.py` | 4 | C output == Python evaluation |
-| `test_optimizer.py` | 5 | Optimised == unoptimised, fewer gates |
-| `test_jit_optimizer.py` | 6 | JIT tokens == full tokens |
+| `test_graph_optimizer.py` | 5 | Optimised == unoptimised, fewer gates |
+| `test_jit_optimizer.py` | 6 | JIT tokens == full tokens; KV cache; prefix cache |
 | `test_hdl_export.py` | 7 | Verilog sim matches C executor |
+| `test_integration.py` | 8 | Full pipeline: compile → optimize → C eval → serialize → HDL |
 | `test_compare.py` | all | Full pipeline bit-exact vs HuggingFace |
 
 ---

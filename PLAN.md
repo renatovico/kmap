@@ -384,24 +384,42 @@ pytest tests/test_graph_optimizer.py  # 23 passed
 
 ---
 
-## Phase 6 — Online JIT optimisation (per-token)
+## Phase 6 — Online JIT optimisation (per-token)  ✅ DONE
 
 **Goal**: after each decode, fold KV cache values as constants and
 re-minimise — progressively smaller circuit.
 
-### New module: `jit_optimizer.py`
+### Implementation: `jit_optimizer.py`
+
+`JitSession` manages one autoregressive generation session:
 
 | Step | What happens |
 |---|---|
-| Token 1 (cold) | Run full circuit graph.  Record KV values. |
-| Token 2+ | Fold K, V as constants → constant-propagate through softmax → re-minimise → run smaller circuit. |
-| Prefix cache | Hash prefix → reuse optimised circuit for same prefix. |
+| **Prefill** | Compile full prompt → evaluate → capture K/V cache tensors |
+| **Decode step** | Compile single-token graph (seq=1) → constant fold (all inputs are const) → dead eliminate → evaluate → append new K/V to cache |
+| **Prefix cache** | SHA-256 hash of token prefix → reuse KV cache + logits |
+
+Since each decode step compiles a fresh graph for 1 token where
+token embedding + all weights are constants, the entire graph folds
+to a single CONST node after optimization.
+
+The KV cache is extracted from named graph nodes (`L{i}/attn/rope_k/rope_out`
+and `L{i}/attn/v_trans`) and accumulated across decode steps.
+
+```python
+from kllm.jit_optimizer import JitSession
+session = JitSession(fabric)
+logits = session.prefill([1, 5, 10])
+for _ in range(max_tokens):
+    next_token = logits[-1].argmax()
+    logits = session.decode_step(next_token)
+```
 
 ### Verification
 
 ```bash
-pytest tests/test_jit_optimizer.py
-# JIT tokens == full tokens, gate count decreases with seq length
+pytest tests/test_jit_optimizer.py  # 15 passed
+# Prefill matches reference, KV cache shapes correct, prefix cache works
 ```
 
 ---

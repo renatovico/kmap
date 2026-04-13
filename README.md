@@ -193,11 +193,13 @@ full roadmap toward the complete gate-circuit architecture.
 | Activation circuits (SiLU, exp, rsqrt) | ✅ Full-domain mmap |
 | Quine-McCluskey gate minimisation | ✅ 8-variable |
 | Pure-NumPy inference (no torch) | ✅ Bit-exact |
-| Binary arithmetic circuits (add, mul) | 🔲 Planned |
-| Circuit graph DAG (full model) | 🔲 Planned |
-| Offline graph optimisation | 🔲 Planned |
-| Online JIT per-token optimisation | 🔲 Planned |
-| FPGA export (Verilog/VHDL) | 🔲 Planned |
+| Binary arithmetic circuits (add, mul, div, …) | 🔲 Phase 2 |
+| cos/sin activation LUTs + float64 support | 🔲 Phase 2 |
+| Circuit graph DAG (all ops as nodes) | 🔲 Phase 3 |
+| C gate executor (zero NumPy runtime) | 🔲 Phase 4 |
+| Offline graph optimisation | 🔲 Phase 5 |
+| Online JIT per-token optimisation | 🔲 Phase 6 |
+| FPGA export (Verilog/VHDL) | 🔲 Phase 7 |
 
 ## Compiled output layout
 

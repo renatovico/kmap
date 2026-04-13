@@ -53,6 +53,11 @@ def _compile_if_needed() -> Path:
         "cc", "-O3", "-shared", "-fPIC", "-march=native",
         "-o", str(lib_so), str(src), "-lm",
     ]
+    # Link BLAS: Accelerate on macOS, OpenBLAS on Linux
+    if platform.system() == "Darwin":
+        cmd += ["-framework", "Accelerate"]
+    else:
+        cmd += ["-lopenblas"]
     subprocess.check_call(cmd)
     return lib_so
 
@@ -206,12 +211,31 @@ _LUT_FN_MAP = {
 }
 
 # ---------------------------------------------------------------
+# Const pre-caching
+# ---------------------------------------------------------------
+
+
+def precompute_consts(graph: CircuitGraph) -> dict[int, np.ndarray]:
+    """Pre-evaluate all CONST nodes once and return a reusable cache.
+
+    Pass the result as ``const_cache`` to ``evaluate_c`` to skip
+    redundant ``np.ascontiguousarray`` calls on every evaluation.
+    """
+    cache: dict[int, np.ndarray] = {}
+    for node in graph.nodes:
+        if node.op == Op.CONST:
+            cache[node.id] = np.ascontiguousarray(node.params["value"])
+    return cache
+
+
+# ---------------------------------------------------------------
 # Main evaluator
 # ---------------------------------------------------------------
 
 
 def evaluate_c(graph: CircuitGraph,
                inputs: dict[int, np.ndarray] | None = None,
+               const_cache: dict[int, np.ndarray] | None = None,
                ) -> dict[int, np.ndarray]:
     """Evaluate a circuit graph using the C tensor ops library.
 
@@ -224,6 +248,10 @@ def evaluate_c(graph: CircuitGraph,
         The circuit to evaluate.
     inputs : dict mapping input node ID → NumPy array
         Values for ``INPUT`` nodes.
+    const_cache : dict mapping CONST node ID → NumPy array, optional
+        Pre-evaluated constant values.  When provided, CONST nodes
+        found in this dict are reused instantly (no copy/check).
+        Call ``precompute_consts(graph)`` to build this once.
 
     Returns
     -------
@@ -232,6 +260,7 @@ def evaluate_c(graph: CircuitGraph,
     """
     lib = _get_lib()
     inputs = inputs or {}
+    const_cache = const_cache or {}
     values: dict[int, np.ndarray] = {}
     order = graph.topological_order()
 
@@ -240,7 +269,10 @@ def evaluate_c(graph: CircuitGraph,
         inp = [values[i] for i in node.inputs]
 
         if node.op == Op.CONST:
-            values[nid] = np.ascontiguousarray(node.params["value"])
+            if nid in const_cache:
+                values[nid] = const_cache[nid]
+            else:
+                values[nid] = np.ascontiguousarray(node.params["value"])
 
         elif node.op == Op.INPUT:
             if nid not in inputs:
@@ -260,165 +292,72 @@ def evaluate_c(graph: CircuitGraph,
             values[nid] = out
 
         elif node.op in (Op.ADD, Op.SUB, Op.MUL, Op.DIV, Op.MAX):
-            a = np.ascontiguousarray(inp[0], dtype=np.float32)
-            b = np.ascontiguousarray(inp[1], dtype=np.float32)
-
-            # Handle scalar (0-d) tensors
-            a_shape = a.shape if a.ndim > 0 else (1,)
-            b_shape = b.shape if b.ndim > 0 else (1,)
-            out_shape = _broadcast_shapes(a_shape, b_shape)
-            out = np.empty(out_shape, dtype=np.float32)
-
-            fn_map = {
-                Op.ADD: lib.ceval_add,
-                Op.SUB: lib.ceval_sub,
-                Op.MUL: lib.ceval_mul,
-                Op.DIV: lib.ceval_div,
-                Op.MAX: lib.ceval_max,
+            a = np.asarray(inp[0], dtype=np.float32)
+            b = np.asarray(inp[1], dtype=np.float32)
+            _np_binop = {
+                Op.ADD: np.add,
+                Op.SUB: np.subtract,
+                Op.MUL: np.multiply,
+                Op.DIV: np.divide,
+                Op.MAX: np.maximum,
             }
-            fn_map[node.op](
-                _to_c_float(out),
-                _to_c_float(a.reshape(-1) if a.ndim == 0 else a),
-                _to_c_int_array(a_shape), len(a_shape),
-                _to_c_float(b.reshape(-1) if b.ndim == 0 else b),
-                _to_c_int_array(b_shape), len(b_shape),
-                _to_c_int_array(out_shape), len(out_shape),
-            )
-            # Match NumPy scalar output behavior
-            if inp[0].ndim == 0 and inp[1].ndim == 0:
-                out = out.reshape(())
-            values[nid] = out
+            values[nid] = _np_binop[node.op](a, b)
 
         elif node.op == Op.CMP_LE:
-            a = np.ascontiguousarray(inp[0], dtype=np.float32)
-            b = np.ascontiguousarray(inp[1], dtype=np.float32)
-            a_shape = a.shape if a.ndim > 0 else (1,)
-            b_shape = b.shape if b.ndim > 0 else (1,)
-            out_shape = _broadcast_shapes(a_shape, b_shape)
-            out = np.empty(out_shape, dtype=np.float32)
-            lib.ceval_cmp_le(
-                _to_c_float(out),
-                _to_c_float(a.reshape(-1) if a.ndim == 0 else a),
-                _to_c_int_array(a_shape), len(a_shape),
-                _to_c_float(b.reshape(-1) if b.ndim == 0 else b),
-                _to_c_int_array(b_shape), len(b_shape),
-                _to_c_int_array(out_shape), len(out_shape),
-            )
-            # Convert to uint8 to match reference evaluator
-            values[nid] = out.astype(np.uint8)
+            a = np.asarray(inp[0], dtype=np.float32)
+            b = np.asarray(inp[1], dtype=np.float32)
+            values[nid] = (a <= b).astype(np.uint8)
 
         elif node.op == Op.MUX:
-            cond = np.ascontiguousarray(inp[0]).astype(np.float32)
-            a = np.ascontiguousarray(inp[1], dtype=np.float32)
-            b = np.ascontiguousarray(inp[2], dtype=np.float32)
-            out = np.empty_like(a)
-            lib.ceval_mux(
-                _to_c_float(out), _to_c_float(cond),
-                _to_c_float(a), _to_c_float(b), a.size)
-            values[nid] = out
+            cond = np.asarray(inp[0], dtype=np.float32)
+            a = np.asarray(inp[1], dtype=np.float32)
+            b = np.asarray(inp[2], dtype=np.float32)
+            values[nid] = np.where(cond != 0.0, b, a)
 
         elif node.op == Op.NEG:
-            x = np.ascontiguousarray(inp[0], dtype=np.float32)
-            out = np.empty_like(x)
-            lib.ceval_neg(_to_c_float(out), _to_c_float(x), x.size)
-            values[nid] = out
+            values[nid] = -np.asarray(inp[0], dtype=np.float32)
 
         elif node.op == Op.ABS:
-            x = np.ascontiguousarray(inp[0], dtype=np.float32)
-            out = np.empty_like(x)
-            lib.ceval_abs(_to_c_float(out), _to_c_float(x), x.size)
-            values[nid] = out
+            values[nid] = np.abs(np.asarray(inp[0], dtype=np.float32))
 
         elif node.op == Op.SQUARE:
-            x = np.ascontiguousarray(inp[0], dtype=np.float32)
-            out = np.empty_like(x)
-            lib.ceval_square(_to_c_float(out), _to_c_float(x), x.size)
-            values[nid] = out
+            x = np.asarray(inp[0], dtype=np.float32)
+            values[nid] = x * x
 
         elif node.op == Op.MATMUL:
+            # Use np.matmul — it links to BLAS (Accelerate/MKL/OpenBLAS)
+            # with optimized dispatch, avoiding the ctypes overhead of
+            # calling our C wrapper per matmul.
             a = np.ascontiguousarray(inp[0], dtype=np.float32)
             b = np.ascontiguousarray(inp[1], dtype=np.float32)
-            out_shape = _matmul_shape(a.shape, b.shape)
-            out = np.empty(out_shape, dtype=np.float32)
-            lib.ceval_matmul(
-                _to_c_float(out),
-                _to_c_float(a), _to_c_int_array(a.shape), a.ndim,
-                _to_c_float(b), _to_c_int_array(b.shape), b.ndim,
-                _to_c_int_array(out_shape), len(out_shape),
-            )
-            values[nid] = out
+            values[nid] = np.matmul(a, b)
 
         elif node.op in (Op.SUM, Op.MAX_REDUCE, Op.MEAN):
-            x = np.ascontiguousarray(inp[0], dtype=np.float32)
+            x = np.asarray(inp[0], dtype=np.float32)
             axis = node.params["axis"]
             keepdims = node.params.get("keepdims", False)
-            # Normalise negative axis
-            if axis < 0:
-                axis = x.ndim + axis
-            out_shape = _reduce_shape(x.shape, axis, keepdims)
-            # Allocate output with the non-keepdims shape for C
-            # (C always outputs reduced shape without keepdims)
-            reduced_shape = _reduce_shape(x.shape, axis, False)
-            reduced_size = 1
-            for s in reduced_shape:
-                reduced_size *= s
-            if reduced_size == 0:
-                reduced_size = 1  # scalar
-            out = np.empty(max(reduced_size, 1), dtype=np.float32)
-
-            fn_map = {
-                Op.SUM: lib.ceval_sum,
-                Op.MAX_REDUCE: lib.ceval_max_reduce,
-                Op.MEAN: lib.ceval_mean,
+            _np_reduce = {
+                Op.SUM: np.sum,
+                Op.MAX_REDUCE: np.max,
+                Op.MEAN: np.mean,
             }
-            fn_map[node.op](
-                _to_c_float(out),
-                _to_c_float(x),
-                _to_c_int_array(x.shape), x.ndim,
-                axis,
-            )
-            values[nid] = out.reshape(out_shape) if out_shape else out[0]
+            values[nid] = _np_reduce[node.op](
+                x, axis=axis, keepdims=keepdims)
 
         elif node.op == Op.ARGMAX:
-            x = np.ascontiguousarray(inp[0], dtype=np.float32)
+            x = np.asarray(inp[0], dtype=np.float32)
             axis = node.params["axis"]
-            if axis < 0:
-                axis = x.ndim + axis
-            reduced_shape = _reduce_shape(x.shape, axis, False)
-            reduced_size = 1
-            for s in reduced_shape:
-                reduced_size *= s
-            if reduced_size == 0:
-                reduced_size = 1
-            out = np.empty(max(reduced_size, 1), dtype=np.int32)
-            lib.ceval_argmax(
-                out.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
-                _to_c_float(x),
-                _to_c_int_array(x.shape), x.ndim,
-                axis,
-            )
-            # Match NumPy's int64 output
-            out = out.astype(np.int64)
-            if reduced_shape:
-                values[nid] = out.reshape(reduced_shape)
-            else:
-                values[nid] = out[0]
+            values[nid] = np.argmax(x, axis=axis)
 
         elif node.op == Op.RESHAPE:
             values[nid] = np.ascontiguousarray(
                 inp[0]).reshape(node.params["shape"])
 
         elif node.op == Op.TRANSPOSE:
-            x = np.ascontiguousarray(inp[0], dtype=np.float32)
-            axes = node.params["axes"]
-            out_shape = tuple(x.shape[a] for a in axes)
-            out = np.empty(out_shape, dtype=np.float32)
-            lib.ceval_transpose(
-                _to_c_float(out), _to_c_float(x),
-                _to_c_int_array(x.shape), x.ndim,
-                _to_c_int_array(axes),
+            values[nid] = np.ascontiguousarray(
+                np.transpose(inp[0], axes=node.params["axes"]),
+                dtype=np.float32,
             )
-            values[nid] = out
 
         elif node.op == Op.CONCAT:
             axis = node.params["axis"]
@@ -431,62 +370,15 @@ def evaluate_c(graph: CircuitGraph,
             values[nid] = np.concatenate(arrays, axis=axis)
 
         elif node.op == Op.REPEAT:
-            x = np.ascontiguousarray(inp[0], dtype=np.float32)
+            x = np.asarray(inp[0], dtype=np.float32)
             repeats = node.params["repeats"]
             axis = node.params["axis"]
-            if axis < 0:
-                axis = x.ndim + axis
-            out_shape = list(x.shape)
-            out_shape[axis] *= repeats
-            out = np.empty(out_shape, dtype=np.float32)
-            lib.ceval_repeat(
-                _to_c_float(out), _to_c_float(x),
-                _to_c_int_array(x.shape), x.ndim,
-                repeats, axis,
-            )
-            values[nid] = out
+            values[nid] = np.repeat(x, repeats, axis=axis)
 
         elif node.op == Op.SLICE:
-            x = np.ascontiguousarray(inp[0], dtype=np.float32)
+            x = np.asarray(inp[0], dtype=np.float32)
             slices = node.params["slices"]
-            # Normalise slices to (start, stop, step) per dimension
-            if not isinstance(slices, tuple):
-                slices = (slices,)
-
-            starts = []
-            stops = []
-            steps = []
-            out_shape_list = []
-
-            for d in range(x.ndim):
-                if d < len(slices):
-                    s = slices[d]
-                    if isinstance(s, slice):
-                        start, stop, step = s.indices(x.shape[d])
-                    else:
-                        # Integer index — not a slice, reduces dim
-                        # For now, use numpy
-                        values[nid] = x[slices]
-                        break
-                else:
-                    start, stop, step = 0, x.shape[d], 1
-                starts.append(start)
-                stops.append(stop)
-                steps.append(step)
-                dim_size = max(0, (stop - start + (step - (1 if step > 0 else -1))) // step)
-                out_shape_list.append(dim_size)
-            else:
-                out_shape = tuple(out_shape_list)
-                out = np.empty(out_shape, dtype=np.float32)
-                lib.ceval_slice(
-                    _to_c_float(out), _to_c_float(x),
-                    _to_c_int_array(x.shape), x.ndim,
-                    _to_c_int_array(starts),
-                    _to_c_int_array(stops),
-                    _to_c_int_array(steps),
-                    _to_c_int_array(out_shape), len(out_shape),
-                )
-                values[nid] = out
+            values[nid] = np.ascontiguousarray(x[slices])
 
         elif node.op == Op.CAST:
             values[nid] = np.asarray(inp[0]).astype(node.params["dtype"])

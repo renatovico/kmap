@@ -233,7 +233,7 @@ class TestResourceEstimation:
         fabric = MockFabric(num_layers=1, hidden_size=8, num_heads=2,
                             num_kv_heads=2, intermediate_size=16,
                             vocab_size=32)
-        graph, _ = compile_model(fabric, [1, 5, 10])
+        graph, _, _kv = compile_model(fabric, [1, 5, 10])
         est = estimate_resources(graph)
         assert est["total_nodes"] > 0
         assert est["estimated_fmax_mhz"] > 0

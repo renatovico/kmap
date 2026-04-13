@@ -68,10 +68,15 @@ class MockFabric:
                 hidden_size, dtype=np.float32)
             self.layers.append(layer)
 
+    def get_transposed(self, layer_idx, proj):
+        if not hasattr(self, '_t_cache'):
+            self._t_cache = {}
+        key = (layer_idx, proj)
+        if key not in self._t_cache:
+            self._t_cache[key] = np.ascontiguousarray(
+                self.layers[layer_idx][proj].T, dtype=np.float32)
+        return self._t_cache[key]
 
-# ---------------------------------------------------------------
-# Reference forward pass (plain NumPy — same as circuit_model.py)
-# ---------------------------------------------------------------
 
 def _np_silu(x):
     with np.errstate(over="ignore", invalid="ignore"):
@@ -184,14 +189,14 @@ class TestCompileModel:
     def test_compiles_without_error(self):
         fab = MockFabric(num_layers=1, hidden_size=16, num_heads=2,
                          num_kv_heads=2, intermediate_size=32)
-        g, logits_id = compile_model(fab, token_ids=[0, 1, 2])
+        g, logits_id, _kv = compile_model(fab, token_ids=[0, 1, 2])
         assert isinstance(g, CircuitGraph)
         assert logits_id >= 0
         assert len(g) > 0
 
     def test_graph_has_expected_ops(self):
         fab = MockFabric(num_layers=1)
-        g, _ = compile_model(fab, token_ids=[0])
+        g, _, _kv = compile_model(fab, token_ids=[0])
         ops = {n.op for n in g.nodes}
         # Must contain at least these
         assert Op.CONST in ops
@@ -202,7 +207,7 @@ class TestCompileModel:
 
     def test_single_token_graph_evaluates(self):
         fab = MockFabric(num_layers=1)
-        g, logits_id = compile_model(fab, token_ids=[5])
+        g, logits_id, _kv = compile_model(fab, token_ids=[5])
         vals = evaluate(g)
         logits = vals[logits_id]
         assert logits.shape == (1, fab.vocab_size)
@@ -211,7 +216,7 @@ class TestCompileModel:
     def test_multi_token_graph_evaluates(self):
         fab = MockFabric(num_layers=1)
         tokens = [1, 2, 3, 4]
-        g, logits_id = compile_model(fab, token_ids=tokens)
+        g, logits_id, _kv = compile_model(fab, token_ids=tokens)
         vals = evaluate(g)
         logits = vals[logits_id]
         assert logits.shape == (len(tokens), fab.vocab_size)
@@ -221,7 +226,7 @@ class TestCompileModel:
         """Graph evaluation must match the NumPy reference."""
         fab = MockFabric(num_layers=2)
         tokens = [10]
-        g, logits_id = compile_model(fab, token_ids=tokens)
+        g, logits_id, _kv = compile_model(fab, token_ids=tokens)
         graph_logits = evaluate(g)[logits_id]
         ref_logits = _reference_forward(fab, tokens)
         np.testing.assert_allclose(
@@ -231,7 +236,7 @@ class TestCompileModel:
         """Multi-token: graph must match reference with causal mask."""
         fab = MockFabric(num_layers=2)
         tokens = [1, 5, 10]
-        g, logits_id = compile_model(fab, token_ids=tokens)
+        g, logits_id, _kv = compile_model(fab, token_ids=tokens)
         graph_logits = evaluate(g)[logits_id]
         ref_logits = _reference_forward(fab, tokens)
         np.testing.assert_allclose(
@@ -240,14 +245,14 @@ class TestCompileModel:
     def test_gate_count_grows_with_layers(self):
         fab1 = MockFabric(num_layers=1)
         fab2 = MockFabric(num_layers=2)
-        g1, _ = compile_model(fab1, token_ids=[0])
-        g2, _ = compile_model(fab2, token_ids=[0])
+        g1, _, _kv = compile_model(fab1, token_ids=[0])
+        g2, _, _kv = compile_model(fab2, token_ids=[0])
         assert g2.gate_count()["total"] > g1.gate_count()["total"]
 
     def test_argmax_on_logits(self):
         """Can append argmax to get predicted token."""
         fab = MockFabric(num_layers=1)
-        g, logits_id = compile_model(fab, token_ids=[0])
+        g, logits_id, _kv = compile_model(fab, token_ids=[0])
         # Take last row's argmax
         last_row = g.slice(logits_id, (slice(-1, None),),
                            name="last_logit")
@@ -258,7 +263,7 @@ class TestCompileModel:
 
     def test_graph_repr(self):
         fab = MockFabric(num_layers=1)
-        g, _ = compile_model(fab, token_ids=[0])
+        g, _, _kv = compile_model(fab, token_ids=[0])
         r = repr(g)
         assert "nodes" in r
 

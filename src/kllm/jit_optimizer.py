@@ -1,31 +1,34 @@
-"""JIT per-token circuit optimization for autoregressive decode.
+"""Graph-based inference — the model IS the machine.
 
-After each decode step, the new K/V cache values become **known
-constants** for all future steps.  This module folds them into the
-graph and re-optimizes — producing a progressively smaller circuit
-as the sequence grows.
+The circuit graph represents the transformer as a machine:
+- Weights are CONST nodes — fixed parts of the machine.
+- Variable state (token embedding, RoPE, KV cache) flows through
+  INPUT nodes.
+- The machine's structure (matmuls, norms, attention, MLP) is built
+  once and reused every token — no recompilation.
 
 Architecture
 ------------
 ``JitSession`` manages one autoregressive generation session:
 
-1. **Prefill** — compile a graph for the full prompt, evaluate,
-   capture K/V cache tensors.
-2. **Decode step** — for each new token:
-   a. Compile a single-token decode graph (seq_len=1, start_pos=N).
-   b. Inject accumulated K/V cache as CONST nodes.
-   c. Constant-fold + dead-eliminate → the attention over past tokens
-      collapses entirely (all inputs are const).
-   d. Evaluate the optimized graph → logits + new K/V.
-   e. Append new K/V to the cache.
-3. **Prefix cache** — hash token prefix → reuse compiled session state.
+1. **Build** — ``compile_decode_template()`` builds the machine once.
+   All weights become CONST nodes.  Variable state becomes INPUT nodes.
+2. **Prefill** — compile a static all-CONST graph for the full prompt,
+   evaluate it, capture K/V cache arrays.
+3. **Decode step** — for each new token:
+   a. Compute the token embedding + RoPE for this position.
+   b. Feed token_embed + rope + KV cache as INPUT values into the machine.
+   c. Evaluate the machine → logits + updated K/V.
+   d. Append new K/V to the cache.
+
+No recompilation, no re-optimization per token — the machine runs.
 
 Usage::
 
     from kllm.jit_optimizer import JitSession
     session = JitSession(fabric)
-    logits = session.prefill([1, 5, 10])      # compile + evaluate prompt
-    logits = session.decode_step(next_token)   # per-token JIT
+    logits = session.prefill([1, 5, 10])
+    logits = session.decode_step(next_token)
 """
 
 from __future__ import annotations
@@ -34,18 +37,22 @@ import hashlib
 
 import numpy as np
 
-from kllm.circuit_compiler import compile_model
-from kllm.circuit_executor import evaluate_c
-from kllm.circuit_graph import CircuitGraph, evaluate
-from kllm.graph_optimizer import optimize_graph, optimization_stats
+from kllm.circuit_compiler import (
+    DecodeMachine,
+    compile_decode_template,
+    compile_model,
+    _build_rope_const,
+)
+from kllm.circuit_executor import evaluate_c, precompute_consts
+from kllm.circuit_graph import CircuitGraph
 
 
 class JitSession:
-    """Manages one autoregressive generation session with JIT optimization.
+    """One autoregressive session.  The machine runs, not rebuilds.
 
-    The session maintains a KV cache and builds optimized graphs
-    for each decode step.  Past K/V values are folded as constants,
-    so the attention over cached positions requires zero compute.
+    On init, builds the decode machine once (``compile_decode_template``).
+    Each ``decode_step`` feeds new inputs and evaluates — zero
+    compilation overhead per token.
     """
 
     def __init__(self, fabric: object) -> None:
@@ -54,9 +61,19 @@ class JitSession:
         self.num_kv_heads = fabric.num_kv_heads
         self.head_dim = fabric.head_dim
 
+        # Build the decode machine once — weights baked in as CONST,
+        # variable state (token, position, KV) as INPUT nodes.
+        self._machine: DecodeMachine = compile_decode_template(fabric)
+
+        # Pre-cache all CONST values so evaluate_c skips them each step.
+        self._const_cache = precompute_consts(self._machine.graph)
+
+        # Precomputed RoPE table (all positions up to max_seq)
+        self._rope_cos, self._rope_sin = _build_rope_const(
+            2048, fabric.head_dim, fabric.rope_theta)
+
         # KV cache: list of (K, V) per layer
         # K shape: (num_kv_heads, seq_so_far, head_dim)
-        # V shape: (num_kv_heads, seq_so_far, head_dim)
         self.kv_cache: list[tuple[np.ndarray, np.ndarray]] = []
         self.position: int = 0
         self.token_history: list[int] = []
@@ -67,16 +84,20 @@ class JitSession:
 
         Returns the logits array (seq_len, vocab_size).
         """
-        graph, logits_id = compile_model(
+        graph, logits_id, kv_node_ids = compile_model(
             self.fabric, token_ids, start_pos=0)
 
-        # Evaluate full graph
+        # Evaluate full graph — one pass gives us everything
         values = evaluate_c(graph)
         logits = values[logits_id]
 
-        # Extract K/V cache from the graph evaluation
-        self.kv_cache = _extract_kv_cache(
-            graph, values, self.num_layers, len(token_ids))
+        # Extract K/V cache directly from known node IDs
+        self.kv_cache = []
+        for k_nid, v_nid in kv_node_ids:
+            self.kv_cache.append((
+                np.asarray(values[k_nid]),
+                np.asarray(values[v_nid]),
+            ))
 
         self.position = len(token_ids)
         self.token_history = list(token_ids)
@@ -84,49 +105,52 @@ class JitSession:
         self.stats.append({
             "step": "prefill",
             "tokens": len(token_ids),
-            "original_nodes": len(graph),
+            "nodes": len(graph),
             "position": self.position,
         })
 
         return logits
 
     def decode_step(self, token_id: int) -> np.ndarray:
-        """Generate one token with JIT optimization.
+        """Run the machine for one token.  No recompilation.
 
-        Compiles a single-token graph, injects KV cache as constants,
-        folds + eliminates, evaluates, and updates the cache.
+        Feeds the new token embedding, RoPE, and KV cache into
+        the machine's INPUT nodes.  Evaluates.  Updates cache.
 
-        Returns the logits array (1, vocab_size).
+        Returns logits array (1, vocab_size).
         """
-        # Compile single-token graph
-        graph, logits_id = compile_model(
-            self.fabric, [token_id], start_pos=self.position)
+        f = self.fabric
+        m = self._machine
 
-        original_nodes = len(graph)
+        # Prepare inputs for the machine
+        token_embed = f.embed_tokens[token_id:token_id + 1].astype(np.float32)
+        rope_cos = self._rope_cos[self.position:self.position + 1]
+        rope_sin = self._rope_sin[self.position:self.position + 1]
 
-        # Optimize: constant fold + dead elimination
-        opt_graph, id_map = optimize_graph(graph, output_ids=[logits_id])
+        inputs: dict[int, np.ndarray] = {
+            m.input_ids["token_embed"]: token_embed,
+            m.input_ids["rope_cos"]: rope_cos,
+            m.input_ids["rope_sin"]: rope_sin,
+        }
 
-        optimized_nodes = len(opt_graph)
-
-        # Evaluate the optimized graph
-        values = evaluate_c(opt_graph)
-        logits = values[id_map[logits_id]]
-
-        # Extract new K/V from the unoptimized graph evaluation
-        # (the optimized graph has already folded everything)
-        # We need to evaluate the full graph to get K/V values
-        full_values = evaluate_c(graph)
-        new_kv = _extract_kv_cache(
-            graph, full_values, self.num_layers, 1)
-
-        # Append new K/V to cache
+        # Feed KV cache as inputs
         for li in range(self.num_layers):
-            old_k, old_v = self.kv_cache[li]
-            new_k, new_v = new_kv[li]
+            k_cache, v_cache = self.kv_cache[li]
+            inputs[m.input_ids[f"L{li}/cache_k"]] = k_cache
+            inputs[m.input_ids[f"L{li}/cache_v"]] = v_cache
+
+        # Run the machine
+        values = evaluate_c(m.graph, inputs, const_cache=self._const_cache)
+
+        # Extract outputs
+        logits = values[m.logits_id]
+
+        # Update KV cache — new_k/new_v include the concat of old + new
+        for li in range(self.num_layers):
+            new_k_id, new_v_id = m.kv_ids[li]
             self.kv_cache[li] = (
-                np.concatenate([old_k, new_k], axis=1),
-                np.concatenate([old_v, new_v], axis=1),
+                np.asarray(values[new_k_id]),
+                np.asarray(values[new_v_id]),
             )
 
         self.position += 1
@@ -135,19 +159,14 @@ class JitSession:
         self.stats.append({
             "step": f"decode_{self.position}",
             "token_id": token_id,
-            "original_nodes": original_nodes,
-            "optimized_nodes": optimized_nodes,
-            "reduction_pct": 100.0 * (1 - optimized_nodes / max(original_nodes, 1)),
             "position": self.position,
         })
 
         return logits
 
     def get_stats(self) -> list[dict]:
-        """Return optimization statistics for each step."""
+        """Return statistics for each step."""
         return self.stats
-
-
 # ---------------------------------------------------------------
 # Prefix cache
 # ---------------------------------------------------------------
@@ -204,48 +223,3 @@ def cached_prefill(
 def clear_prefix_cache() -> None:
     """Clear the prefix cache."""
     _PREFIX_CACHE.clear()
-
-
-# ---------------------------------------------------------------
-# KV cache extraction
-# ---------------------------------------------------------------
-
-def _extract_kv_cache(
-    graph: CircuitGraph,
-    values: dict[int, np.ndarray],
-    num_layers: int,
-    seq_len: int,
-) -> list[tuple[np.ndarray, np.ndarray]]:
-    """Extract K/V values from evaluated graph by finding named nodes.
-
-    The compiler names KV nodes as ``L{i}/attn/k_trans`` and
-    ``L{i}/attn/v_trans`` (after RoPE for K).
-    """
-    cache: list[tuple[np.ndarray, np.ndarray]] = []
-
-    for li in range(num_layers):
-        # Find the K node after RoPE: L{i}/attn/rope_k/rope_out
-        k_val = None
-        v_val = None
-
-        for node in graph.nodes:
-            if node.name == f"L{li}/attn/rope_k/rope_out":
-                k_val = values[node.id]
-            elif node.name == f"L{li}/attn/v_trans":
-                v_val = values[node.id]
-
-        if k_val is None or v_val is None:
-            # Fallback: search for approximate names
-            for node in graph.nodes:
-                if f"L{li}" in node.name and "rope_k" in node.name and "rope_out" in node.name:
-                    k_val = values[node.id]
-                if f"L{li}" in node.name and "v_trans" in node.name:
-                    v_val = values[node.id]
-
-        if k_val is None or v_val is None:
-            raise RuntimeError(
-                f"Could not find K/V cache nodes for layer {li}")
-
-        cache.append((np.asarray(k_val), np.asarray(v_val)))
-
-    return cache

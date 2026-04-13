@@ -236,7 +236,7 @@ def compile_model(
         for proj in ["q_proj", "k_proj", "v_proj", "o_proj",
                       "gate_proj", "up_proj", "down_proj"]:
             wn[f"{proj}_t"] = g.const(
-                lw[proj].T.astype(np.float32),
+                f.get_transposed(li, proj),
                 name=f"L{li}/{proj}_t")
         wn["input_ln_w"] = g.const(
             lw["input_layernorm_weight"].astype(np.float32),
@@ -300,4 +300,145 @@ def compile_model(
     # ---- Logit projection ----
     logits = g.matmul(hidden, lm_head_t, name="logits")
 
-    return g, logits
+    # kv_caches is a list of (k_node_id, v_node_id) per layer —
+    # callers can use these to extract KV values without searching
+    # by name.
+    return g, logits, kv_caches
+
+
+# ---------------------------------------------------------------
+# Decode template — the persistent machine
+# ---------------------------------------------------------------
+
+class DecodeMachine:
+    """A pre-built single-token decode graph with INPUT nodes.
+
+    The machine's structure (matmuls, norms, attention, MLP) is fixed.
+    Weights are baked in as CONST.  Variable state (token embedding,
+    RoPE, KV cache) is fed through INPUT nodes each step.
+
+    This avoids rebuilding and re-optimizing the graph every token.
+    """
+
+    def __init__(
+        self,
+        graph: CircuitGraph,
+        logits_id: int,
+        kv_ids: list[tuple[int, int]],   # (new_k_id, new_v_id) per layer
+        input_ids: dict[str, int],        # name → input node ID
+    ) -> None:
+        self.graph = graph
+        self.logits_id = logits_id
+        self.kv_ids = kv_ids
+        self.input_ids = input_ids
+
+
+def compile_decode_template(
+    fabric: "kllm.fabric.Fabric",
+    max_seq: int = 2048,
+) -> DecodeMachine:
+    """Build the decode machine once.  Reuse every token.
+
+    Weights are CONST (part of the machine).  Variable state is INPUT:
+      - ``token_embed``: (1, hidden_size) — embedding of the new token
+      - ``rope_cos``, ``rope_sin``: (1, head_dim) — position encoding
+      - ``L{i}/cache_k``, ``L{i}/cache_v``: per-layer KV cache
+
+    Returns a ``DecodeMachine`` with the graph and all handle IDs.
+    """
+    f = fabric
+    g = CircuitGraph()
+    seq_len = 1  # always single-token decode
+    input_ids: dict[str, int] = {}
+
+    # ---- Variable inputs ----
+    hidden = g.input(
+        shape=(1, f.num_heads * f.head_dim),
+        name="token_embed")
+    input_ids["token_embed"] = hidden
+
+    cos_node = g.input(shape=(1, f.head_dim), name="rope_cos")
+    sin_node = g.input(shape=(1, f.head_dim), name="rope_sin")
+    input_ids["rope_cos"] = cos_node
+    input_ids["rope_sin"] = sin_node
+
+    # Per-layer KV cache inputs (shape varies with sequence length —
+    # the evaluator doesn't check shapes, just passes the array through)
+    kv_cache_inputs: list[tuple[int, int]] = []
+    for li in range(f.num_layers):
+        k_in = g.input(
+            shape=(f.num_kv_heads, 1, f.head_dim),  # placeholder shape
+            name=f"L{li}/cache_k")
+        v_in = g.input(
+            shape=(f.num_kv_heads, 1, f.head_dim),
+            name=f"L{li}/cache_v")
+        input_ids[f"L{li}/cache_k"] = k_in
+        input_ids[f"L{li}/cache_v"] = v_in
+        kv_cache_inputs.append((k_in, v_in))
+
+    # ---- Fixed CONST: scale ----
+    scale_val = np.float32(1.0 / np.sqrt(f.head_dim))
+    scale_node = g.const(scale_val, name="attn_scale")
+
+    # ---- Fixed CONST: all layer weights ----
+    layer_weights: list[dict[str, int]] = []
+    for li in range(f.num_layers):
+        lw = f.layers[li]
+        wn: dict[str, int] = {}
+        for proj in ["q_proj", "k_proj", "v_proj", "o_proj",
+                      "gate_proj", "up_proj", "down_proj"]:
+            wn[f"{proj}_t"] = g.const(
+                f.get_transposed(li, proj),
+                name=f"L{li}/{proj}_t")
+        wn["input_ln_w"] = g.const(
+            lw["input_layernorm_weight"].astype(np.float32),
+            name=f"L{li}/input_ln_w")
+        wn["post_ln_w"] = g.const(
+            lw["post_attention_layernorm_weight"].astype(np.float32),
+            name=f"L{li}/post_ln_w")
+        layer_weights.append(wn)
+
+    final_ln_w = g.const(f.final_norm_weight.astype(np.float32),
+                         name="final_ln_w")
+    lm_head_t = g.const(f.lm_head.T.astype(np.float32),
+                        name="lm_head_t")
+
+    # ---- Layer loop (seq_len=1, no causal mask needed) ----
+    kv_out_ids: list[tuple[int, int]] = []
+
+    for li in range(f.num_layers):
+        wn = layer_weights[li]
+        prefix = f"L{li}"
+
+        residual = hidden
+        hidden = g.rms_norm(hidden, wn["input_ln_w"],
+                            f.rms_norm_eps, name=f"{prefix}/pre_attn_norm")
+
+        kv_k_in, kv_v_in = kv_cache_inputs[li]
+        attn_out, new_k, new_v = _attention_layer(
+            g, hidden, wn, cos_node, sin_node, scale_node,
+            kv_k_in, kv_v_in,
+            f.num_heads, f.num_kv_heads, f.head_dim, f.num_groups,
+            seq_len, 0, name=f"{prefix}/attn")  # start_pos=0 doesn't matter for seq_len=1
+
+        kv_out_ids.append((new_k, new_v))
+
+        hidden = g.add(residual, attn_out, name=f"{prefix}/residual1")
+
+        residual = hidden
+        hidden = g.rms_norm(hidden, wn["post_ln_w"],
+                            f.rms_norm_eps, name=f"{prefix}/pre_mlp_norm")
+        mlp_out = _mlp_layer(g, hidden, wn, name=f"{prefix}/mlp")
+        hidden = g.add(residual, mlp_out, name=f"{prefix}/residual2")
+
+    # ---- Final norm + logits ----
+    hidden = g.rms_norm(hidden, final_ln_w, f.rms_norm_eps,
+                        name="final_norm")
+    logits = g.matmul(hidden, lm_head_t, name="logits")
+
+    return DecodeMachine(
+        graph=g,
+        logits_id=logits,
+        kv_ids=kv_out_ids,
+        input_ids=input_ids,
+    )

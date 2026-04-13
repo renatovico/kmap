@@ -128,6 +128,25 @@ class Fabric:
         self.load_time = time.perf_counter() - t0
 
     # ------------------------------------------------------------------
+    # Transposed-weight cache (shared across all compile calls)
+    # ------------------------------------------------------------------
+
+    def get_transposed(self, layer_idx: int, proj: str) -> np.ndarray:
+        """Return ``layers[layer_idx][proj].T`` as contiguous float32.
+
+        Results are cached so that ``compile_model`` and
+        ``compile_decode_template`` share the same array objects,
+        avoiding duplicate multi-GB allocations.
+        """
+        if not hasattr(self, "_t_cache"):
+            self._t_cache: dict[tuple[int, str], np.ndarray] = {}
+        key = (layer_idx, proj)
+        if key not in self._t_cache:
+            self._t_cache[key] = np.ascontiguousarray(
+                self.layers[layer_idx][proj].T, dtype=np.float32)
+        return self._t_cache[key]
+
+    # ------------------------------------------------------------------
     # Class method: download from HuggingFace and cache
     # ------------------------------------------------------------------
 

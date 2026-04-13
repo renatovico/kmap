@@ -67,6 +67,15 @@ class MockFabric:
                 hidden_size, dtype=np.float32)
             self.layers.append(layer)
 
+    def get_transposed(self, layer_idx, proj):
+        if not hasattr(self, '_t_cache'):
+            self._t_cache = {}
+        key = (layer_idx, proj)
+        if key not in self._t_cache:
+            self._t_cache[key] = np.ascontiguousarray(
+                self.layers[layer_idx][proj].T, dtype=np.float32)
+        return self._t_cache[key]
+
 
 @pytest.fixture
 def fabric():
@@ -85,18 +94,18 @@ def compiled(fabric):
 
 class TestCompileAndEvaluate:
     def test_compile_produces_valid_graph(self, compiled):
-        graph, logits_id = compiled
+        graph, logits_id, _kv = compiled
         assert len(graph.nodes) > 10
         assert logits_id in {n.id for n in graph.nodes}
 
     def test_reference_evaluate_gives_logits(self, compiled, fabric):
-        graph, logits_id = compiled
+        graph, logits_id, _kv = compiled
         result = evaluate(graph)
         logits = result[logits_id]
         assert logits.shape[-1] == fabric.vocab_size
 
     def test_c_evaluate_matches_reference(self, compiled):
-        graph, logits_id = compiled
+        graph, logits_id, _kv = compiled
         ref = evaluate(graph)
         c_result = evaluate_c(graph)
         np.testing.assert_allclose(
@@ -110,12 +119,12 @@ class TestCompileAndEvaluate:
 
 class TestOptimizePipeline:
     def test_optimize_reduces_nodes(self, compiled):
-        graph, logits_id = compiled
+        graph, logits_id, _kv = compiled
         opt, id_map = optimize_graph(graph, [logits_id])
         assert len(opt.nodes) <= len(graph.nodes)
 
     def test_optimized_matches_original(self, compiled):
-        graph, logits_id = compiled
+        graph, logits_id, _kv = compiled
         ref = evaluate(graph)
         opt, id_map = optimize_graph(graph, [logits_id])
         opt_result = evaluate(opt)
@@ -125,7 +134,7 @@ class TestOptimizePipeline:
         )
 
     def test_optimized_c_matches_original(self, compiled):
-        graph, logits_id = compiled
+        graph, logits_id, _kv = compiled
         ref = evaluate(graph)
         opt, id_map = optimize_graph(graph, [logits_id])
         c_result = evaluate_c(opt)
@@ -135,7 +144,7 @@ class TestOptimizePipeline:
         )
 
     def test_optimization_stats_valid(self, compiled):
-        graph, logits_id = compiled
+        graph, logits_id, _kv = compiled
         opt, _ = optimize_graph(graph, [logits_id])
         stats = optimization_stats(graph, opt)
         assert stats["original_nodes"] >= stats["optimized_nodes"]
@@ -148,7 +157,7 @@ class TestOptimizePipeline:
 
 class TestSerializationRoundTrip:
     def test_serialize_deserialize_preserves_output(self, compiled):
-        graph, logits_id = compiled
+        graph, logits_id, _kv = compiled
         ref = evaluate(graph)
         with tempfile.TemporaryDirectory() as td:
             graph.serialize(td)
@@ -159,7 +168,7 @@ class TestSerializationRoundTrip:
         )
 
     def test_serialize_optimized(self, compiled):
-        graph, logits_id = compiled
+        graph, logits_id, _kv = compiled
         opt, id_map = optimize_graph(graph, [logits_id])
         new_id = id_map[logits_id]
         ref = evaluate(opt)
@@ -178,7 +187,7 @@ class TestSerializationRoundTrip:
 
 class TestHDLExportIntegration:
     def test_export_verilog_from_compiled(self, compiled):
-        graph, _ = compiled
+        graph, _, _kv = compiled
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "top.v")
             content = export_verilog(graph, path)
@@ -186,7 +195,7 @@ class TestHDLExportIntegration:
             assert os.path.isfile(path)
 
     def test_export_vhdl_from_compiled(self, compiled):
-        graph, _ = compiled
+        graph, _, _kv = compiled
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "top.vhd")
             content = export_vhdl(graph, path)
@@ -194,7 +203,7 @@ class TestHDLExportIntegration:
             assert os.path.isfile(path)
 
     def test_export_testbench(self, compiled):
-        graph, logits_id = compiled
+        graph, logits_id, _kv = compiled
         values = evaluate(graph)
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "tb.sv")
@@ -202,7 +211,7 @@ class TestHDLExportIntegration:
             assert "module" in content.lower() or "initial" in content.lower()
 
     def test_resource_estimate(self, compiled):
-        graph, _ = compiled
+        graph, _, _kv = compiled
         res = estimate_resources(graph)
         assert res["luts"] > 0
         assert res["dsps"] >= 0
@@ -216,7 +225,7 @@ class TestFullPipeline:
     def test_end_to_end(self, fabric):
         """Full pipeline: compile → optimize → C eval → serialize → load → HDL."""
         # Step 1: compile
-        graph, logits_id = compile_model(fabric, [2, 7, 15])
+        graph, logits_id, _kv = compile_model(fabric, [2, 7, 15])
         ref_logits = evaluate(graph)[logits_id]
 
         # Step 2: optimize
@@ -254,15 +263,15 @@ class TestFullPipeline:
 
     def test_different_token_sequences_differ(self, fabric):
         """Different inputs produce different logits."""
-        g1, lid1 = compile_model(fabric, [1, 2])
-        g2, lid2 = compile_model(fabric, [3, 4])
+        g1, lid1, _kv = compile_model(fabric, [1, 2])
+        g2, lid2, _kv = compile_model(fabric, [3, 4])
         r1 = evaluate(g1)[lid1]
         r2 = evaluate(g2)[lid2]
         assert not np.allclose(r1, r2)
 
     def test_argmax_consistency(self, fabric):
         """argmax(ref) == argmax(C_eval) == argmax(optimized_C_eval)."""
-        graph, lid = compile_model(fabric, [5, 10, 20])
+        graph, lid, _kv = compile_model(fabric, [5, 10, 20])
         ref = evaluate(graph)[lid]
         c_res = evaluate_c(graph)[lid]
         opt, id_map = optimize_graph(graph, [lid])

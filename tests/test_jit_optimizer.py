@@ -37,7 +37,7 @@ class TestJitSession:
         token_ids = [1, 5, 10]
 
         # Direct evaluation
-        graph, logits_id = compile_model(fabric, token_ids)
+        graph, logits_id, _kv = compile_model(fabric, token_ids)
         ref_logits = evaluate(graph)[logits_id]
 
         # JIT prefill
@@ -79,17 +79,15 @@ class TestJitSession:
         session.decode_step(10)
         assert session.kv_cache[0][0].shape[1] == 3  # seq=3
 
-    def test_decode_optimizes_graph(self, fabric):
-        """Decode step should fold the all-constant graph."""
+    def test_decode_runs_machine(self, fabric):
+        """Decode step runs the persistent machine (no recompilation)."""
         session = JitSession(fabric)
         session.prefill([1, 5])
-        session.decode_step(10)
+        logits = session.decode_step(10)
 
-        stats = session.get_stats()
-        decode_stat = stats[-1]
-        # The single-token graph is all constants → should fold
-        assert decode_stat["optimized_nodes"] < decode_stat["original_nodes"]
-        assert decode_stat["reduction_pct"] > 0
+        # Should produce valid logits
+        assert logits.shape == (1, 32)
+        assert np.isfinite(logits).all()
 
     def test_multiple_decode_steps(self, fabric):
         session = JitSession(fabric)

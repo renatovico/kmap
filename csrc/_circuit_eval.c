@@ -6,14 +6,24 @@
  * The Python wrapper calls these via ctypes, managing the evaluation
  * loop and memory allocation.
  *
- * Compile:
- *   cc -O3 -shared -fPIC -march=native -o _circuit_eval.so _circuit_eval.c -lm
+ * Compile (macOS — links Accelerate for BLAS sgemm):
+ *   cc -O3 -shared -fPIC -march=native -o _circuit_eval.so _circuit_eval.c -lm -framework Accelerate
+ *
+ * Compile (Linux — links OpenBLAS):
+ *   cc -O3 -shared -fPIC -march=native -o _circuit_eval.so _circuit_eval.c -lm -lopenblas
  */
 
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* BLAS sgemm — prefer Accelerate on macOS, OpenBLAS elsewhere */
+#ifdef __APPLE__
+#include <Accelerate/Accelerate.h>
+#else
+#include <cblas.h>
+#endif
 
 #define MAX_DIMS 8
 
@@ -299,18 +309,16 @@ void ceval_matmul(float *out,
         }
         int o_off = bi * o_mat_size;
 
-        /* Standard 2D matmul: out[i,j] = sum_p a[i,p] * b[p,j] */
+        /* BLAS sgemm: C = alpha * A @ B + beta * C
+         * Row-major: use CblasRowMajor, no transpose.
+         * A is (m, k), B is (k, n), C is (m, n). */
         const float *A = a + a_off;
         const float *B = b + b_off;
         float *O = out + o_off;
-        for (int i = 0; i < m; i++) {
-            for (int j = 0; j < n; j++) {
-                float acc = 0.0f;
-                for (int p = 0; p < k; p++)
-                    acc += A[i * k + p] * B[p * n + j];
-                O[i * n + j] = acc;
-            }
-        }
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    m, n, k,
+                    1.0f, A, k, B, n,
+                    0.0f, O, n);
     }
 }
 

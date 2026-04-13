@@ -316,7 +316,7 @@ class TestOptimizeGraph:
                             num_kv_heads=2, intermediate_size=16,
                             vocab_size=32)
         token_ids = [1, 5, 10]
-        graph, logits_id = compile_model(fabric, token_ids)
+        graph, logits_id, _kv = compile_model(fabric, token_ids)
 
         original_count = len(graph)
         ref = evaluate(graph)

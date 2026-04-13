@@ -142,7 +142,7 @@ def main(argv: list[str] | None = None) -> None:
         )
 
         print(f"Compiling {len(token_ids)} tokens to circuit graph...")
-        graph, logits_id = compile_model(fabric, token_ids)
+        graph, logits_id, _kv = compile_model(fabric, token_ids)
         opt_graph, id_map = optimize_graph(graph, [logits_id])
 
         hdl_dir = os.path.join(args.save_dir, "hdl")

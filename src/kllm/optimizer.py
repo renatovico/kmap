@@ -541,3 +541,50 @@ class CircuitOptimizer:
             f"[+] Cached {total_bytes / 1e9:.2f} GB to {cache_dir} "
             f"in {elapsed:.1f}s ({fabric.num_layers} layers)"
         )
+
+        # ---- Gate-quantized weights (uint8 per-row) ----
+        self._materialize_gate_weights(fabric, cache_dir)
+
+    def _materialize_gate_weights(
+        self,
+        fabric: "Fabric",
+        cache_dir: str,
+    ) -> None:
+        """Quantize weights to uint8 per-row and save for the gate engine.
+
+        Saves ``<cache_dir>/gate/layer_<i>/<name>.npz`` with keys
+        ``wq`` (uint8), ``scale`` (float32), ``zero`` (float32).
+        """
+        from kllm.codebook import quantize_weight_u8
+        from kllm.fabric import LINEAR_NAMES
+
+        gate_dir = os.path.join(cache_dir, "gate")
+        os.makedirs(gate_dir, exist_ok=True)
+
+        print("\n[*] Quantizing weights to uint8 for gate engine …")
+        t0 = time.perf_counter()
+
+        total_bytes = 0
+        max_err = 0.0
+
+        for li, layer_w in enumerate(fabric.layers):
+            layer_dir = os.path.join(gate_dir, f"layer_{li}")
+            os.makedirs(layer_dir, exist_ok=True)
+            for name in LINEAR_NAMES:
+                w = layer_w[name]
+                wq, scale, zero = quantize_weight_u8(w)
+                # Verify
+                w_recon = wq.astype(np.float32) * scale[:, None] + zero[:, None]
+                err = np.max(np.abs(w - w_recon))
+                max_err = max(max_err, err)
+                np.savez(
+                    os.path.join(layer_dir, f"{name}.npz"),
+                    wq=wq, scale=scale, zero=zero,
+                )
+                total_bytes += wq.nbytes + scale.nbytes + zero.nbytes
+
+        elapsed = time.perf_counter() - t0
+        print(
+            f"[+] Gate weights: {total_bytes / 1e6:.0f} MB "
+            f"(max quant error: {max_err:.6f}) in {elapsed:.1f}s"
+        )

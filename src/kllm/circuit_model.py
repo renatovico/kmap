@@ -395,9 +395,140 @@ class CircuitTransformer:
     ) -> np.ndarray:
         """Blocking forward — uses the fast path when available."""
         if self._math._fast:
+            if getattr(self._f, "_gate_mode", False):
+                return self._forward_gate(token_ids, start_pos)
             return self._forward_fast(token_ids, start_pos)
         result = None
         for stage, _, data in self.forward_gen(token_ids, start_pos):
             if stage == "logits":
                 result = data
         return result
+
+    # ---- Gate Engine forward (uint8 integer-only matmul) ---------
+
+    def _forward_gate(
+        self, token_ids: list[int], start_pos: int,
+    ) -> np.ndarray:
+        """Forward pass where all linear projections use the gate engine.
+
+        Weight matrices are uint8-quantised; matmul uses integer
+        multiply-accumulate (ARM UDOT / x86 VNNI).  Activation
+        functions remain Z3-verified NumPy (already pure gates).
+        """
+        from kllm.codebook import gate_matmul, build_gate_cache
+
+        f = self._f
+        np_silu = CircuitMath._np_silu
+        np_exp = CircuitMath._np_exp
+        np_rsqrt = CircuitMath._np_rsqrt
+        num_heads = f.num_heads
+        num_kv_heads = f.num_kv_heads
+        head_dim = f.head_dim
+        num_groups = f.num_groups
+        eps = f.rms_norm_eps
+        scale = self._scale
+
+        # Build ctypes pointer caches on first call
+        if not hasattr(self, "_gate_caches"):
+            self._gate_caches = []
+            for li in range(f.num_layers):
+                layer_cache = {}
+                for name in ("q_proj", "k_proj", "v_proj", "o_proj",
+                             "gate_proj", "up_proj", "down_proj"):
+                    layer_cache[name] = build_gate_cache(
+                        f.gate_layers[li][name],
+                    )
+                self._gate_caches.append(layer_cache)
+
+        hidden = f.embed_tokens[token_ids]   # (seq, hidden)
+        seq = hidden.shape[0]
+
+        cos = self._rope_cos[start_pos:start_pos + seq]
+        sin = self._rope_sin[start_pos:start_pos + seq]
+        cos_b = cos[np.newaxis, :, :]
+        sin_b = sin[np.newaxis, :, :]
+        half = head_dim // 2
+
+        def _gp(cache: dict, x: np.ndarray) -> np.ndarray:
+            return gate_matmul(
+                cache["wq_arr"], cache["ws_arr"], cache["wz_arr"],
+                x, _cache=cache,
+            )
+
+        for li in range(f.num_layers):
+            w = f.layers[li]
+            gc = self._gate_caches[li]
+
+            # ---- RMSNorm (pre-attention) ----
+            residual = hidden
+            var = np.mean(hidden.astype(np.float64) ** 2, axis=-1, keepdims=True)
+            rscale = np_rsqrt((var + eps).astype(np.float32))
+            normed = (hidden * rscale).astype(np.float32) * w["input_layernorm_weight"]
+
+            # ---- QKV projection (gate engine) ----
+            q = _gp(gc["q_proj"], normed)
+            k = _gp(gc["k_proj"], normed)
+            v = _gp(gc["v_proj"], normed)
+
+            q = q.reshape(seq, num_heads, head_dim).transpose(1, 0, 2)
+            k = k.reshape(seq, num_kv_heads, head_dim).transpose(1, 0, 2)
+            v = v.reshape(seq, num_kv_heads, head_dim).transpose(1, 0, 2)
+
+            # ---- RoPE (inline) ----
+            q1, q2 = q[..., :half], q[..., half:]
+            q = q * cos_b + np.concatenate([-q2, q1], axis=-1) * sin_b
+            k1, k2 = k[..., :half], k[..., half:]
+            k = k * cos_b + np.concatenate([-k2, k1], axis=-1) * sin_b
+
+            # ---- KV cache ----
+            if li < len(self._kv_cache):
+                kp, vp = self._kv_cache[li]
+                k = np.concatenate([kp, k], axis=1)
+                v = np.concatenate([vp, v], axis=1)
+                self._kv_cache[li] = (k, v)
+            else:
+                self._kv_cache.append((k, v))
+
+            # ---- GQA + attention ----
+            if num_groups > 1:
+                k_exp = np.repeat(k, num_groups, axis=0)
+                v_exp = np.repeat(v, num_groups, axis=0)
+            else:
+                k_exp, v_exp = k, v
+
+            scores = np.matmul(q, k_exp.transpose(0, 2, 1)) * scale
+
+            if seq > 1:
+                total_seq = k.shape[1]
+                q_pos = np.arange(start_pos, start_pos + seq)[:, None]
+                k_pos = np.arange(total_seq)[None, :]
+                causal = np.where(
+                    k_pos <= q_pos, np.float32(0.0), np.float32(-np.inf),
+                )
+                scores += causal[np.newaxis, :, :]
+
+            # ---- Inline softmax ----
+            m = scores.max(axis=-1, keepdims=True)
+            e = np_exp((scores - m).astype(np.float32))
+            attn_w = e / e.sum(axis=-1, keepdims=True)
+
+            context = np.matmul(attn_w, v_exp)
+            context = context.transpose(1, 0, 2).reshape(seq, -1)
+            hidden = residual + _gp(gc["o_proj"], context)
+
+            # ---- RMSNorm (pre-MLP) ----
+            residual = hidden
+            var = np.mean(hidden.astype(np.float64) ** 2, axis=-1, keepdims=True)
+            rscale = np_rsqrt((var + eps).astype(np.float32))
+            normed = (hidden * rscale).astype(np.float32) * w["post_attention_layernorm_weight"]
+
+            # ---- MLP (gate engine) ----
+            gate = _gp(gc["gate_proj"], normed)
+            up = _gp(gc["up_proj"], normed)
+            hidden = residual + _gp(gc["down_proj"], np_silu(gate) * up)
+
+        # ---- Final norm + lm_head (float32 — tiny vs weight reads) ----
+        var = np.mean(hidden.astype(np.float64) ** 2, axis=-1, keepdims=True)
+        rscale = np_rsqrt((var + eps).astype(np.float32))
+        hidden = (hidden * rscale).astype(np.float32) * f.final_norm_weight
+        return hidden @ f.lm_head.T

@@ -77,12 +77,20 @@ class Fabric:
         t0 = time.perf_counter()
 
         cache_dir = os.path.join(save_dir, "optimized")
+        gate_dir = os.path.join(cache_dir, "gate")
         if os.path.isfile(os.path.join(cache_dir, "embed_tokens.npy")):
             self._load_cached(cache_dir)
             self._optimized = True
+            # Check for gate-quantized weights
+            if os.path.isdir(gate_dir):
+                self._load_gate_weights(gate_dir)
+                self._gate_mode = True
+            else:
+                self._gate_mode = False
         else:
             self._load_z3_gates(save_dir)
             self._optimized = False
+            self._gate_mode = False
 
         self.load_time: float = time.perf_counter() - t0
 
@@ -123,6 +131,21 @@ class Fabric:
                 mmap_mode="r",
             )
             self.layers.append(layer)
+
+    def _load_gate_weights(self, gate_dir: str) -> None:
+        """Load uint8-quantized weights for the gate engine."""
+        self.gate_layers: list[dict[str, dict]] = []
+        for li in range(self.num_layers):
+            layer_dir = os.path.join(gate_dir, f"layer_{li}")
+            gate_layer: dict[str, dict] = {}
+            for name in LINEAR_NAMES:
+                d = np.load(os.path.join(layer_dir, f"{name}.npz"))
+                gate_layer[name] = {
+                    "wq": d["wq"],       # (M, K) uint8
+                    "scale": d["scale"],  # (M,) float32
+                    "zero": d["zero"],    # (M,) float32
+                }
+            self.gate_layers.append(gate_layer)
 
     def _load_z3_gates(self, save_dir: str) -> None:
         """Original Z3 gate reconstruction (shift + XOR → float32)."""

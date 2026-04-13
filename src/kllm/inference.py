@@ -56,10 +56,11 @@ class BitLogicInferenceEngine:
         print("[*] Loading Z3 gate fabric …")
         self.fabric = Fabric(save_dir)
         if self.fabric._optimized:
+            mode = "gate engine (uint8)" if getattr(self.fabric, "_gate_mode", False) else "mmap"
             print(
                 f"[+] Weights loaded from optimized cache in "
                 f"{self.fabric.load_time:.1f}s "
-                f"({self.fabric.num_layers} layers, mmap)"
+                f"({self.fabric.num_layers} layers, {mode})"
             )
         else:
             print(

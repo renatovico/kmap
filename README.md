@@ -212,7 +212,9 @@ lossless_logic/
 ├── circuits/
 │   ├── silu_p0.bin … p3.bin    # 4 × 4 GB (full float32 domain)
 │   ├── exp_p0.bin  … p3.bin    # 4 × 4 GB
-│   └── rsqrt_p0.bin … p3.bin   # 4 × 4 GB
+│   ├── rsqrt_p0.bin … p3.bin   # 4 × 4 GB
+│   ├── cos_p0.bin … p3.bin     # 4 × 4 GB (RoPE)
+│   └── sin_p0.bin … p3.bin     # 4 × 4 GB (RoPE)
 └── tokenizer/
     ├── tokenizer.json
     ├── tokenizer_config.json

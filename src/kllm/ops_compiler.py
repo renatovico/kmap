@@ -25,6 +25,16 @@ import numpy as np
 from kllm.circuits import ArithmeticUnit, _exp_fn, _rsqrt_fn, _silu_fn
 
 
+def _cos_fn(x: np.ndarray) -> np.ndarray:
+    with np.errstate(invalid="ignore"):
+        return np.cos(x.astype(np.float64)).astype(np.float32)
+
+
+def _sin_fn(x: np.ndarray) -> np.ndarray:
+    with np.errstate(invalid="ignore"):
+        return np.sin(x.astype(np.float64)).astype(np.float32)
+
+
 class OpsCompiler:
     """Trace-compile all transformer operations into Z3 circuits.
 
@@ -220,6 +230,8 @@ class OpsCompiler:
             ("silu", _silu_fn),
             ("exp", _exp_fn),
             ("rsqrt", _rsqrt_fn),
+            ("cos", _cos_fn),
+            ("sin", _sin_fn),
         ]:
             print(f"  [circuits] Compiling {op_name} (full 2³² domain) …")
             t0 = time.perf_counter()

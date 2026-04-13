@@ -549,6 +549,16 @@ def _rsqrt_fn(x: np.ndarray) -> np.ndarray:
         return (1.0 / np.sqrt(x.astype(np.float64))).astype(np.float32)
 
 
+def _cos_fn(x: np.ndarray) -> np.ndarray:
+    with np.errstate(invalid="ignore"):
+        return np.cos(x.astype(np.float64)).astype(np.float32)
+
+
+def _sin_fn(x: np.ndarray) -> np.ndarray:
+    with np.errstate(invalid="ignore"):
+        return np.sin(x.astype(np.float64)).astype(np.float32)
+
+
 def compile_arithmetic_unit(
     traced_activations: dict[str, np.ndarray],
     timeout: int = 200,

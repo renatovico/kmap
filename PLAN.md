@@ -523,3 +523,78 @@ kllm --mode compare --text "Hello world" --max-tokens 10
 | JIT = offline bulk + online per-token | Offline: structure; online: adapts to data |
 | FPGA is the end-goal target | Gate representation must be synthesisable |
 | Bit-exact invariant throughout | Never trade correctness for optimisation |
+
+---
+
+## Phase 9 — Unify circuit graph as the inference engine
+
+**Goal**: kill the Z3/mmap legacy path.  The circuit graph already
+handles everything — weights as CONST nodes, activations as LUT nodes,
+all arithmetic as DAG ops.  Z3 is redundant.  The 48 GB mmap files
+are redundant.  Single pipeline:
+
+```
+HuggingFace model
+      │
+      ▼
+Fabric.from_pretrained()     ← torch download, extract float32 weights
+      │
+      ▼
+compile_model(fabric, tokens) → CircuitGraph
+      │
+      ▼
+optimize_graph()              → constant fold, dead eliminate
+      │
+      ▼
+serialize() / deserialize()   → canonical compiled format on disk
+      │
+      ▼
+JitSession + evaluate_c()    → autoregressive inference (C executor)
+      │
+      ▼
+hdl_export (optional)        → Verilog / VHDL for FPGA
+```
+
+### Why Z3 is no longer needed
+
+| What Z3 provided | What circuit graph does instead |
+|---|---|
+| Byte-plane weight decomposition | Not needed — weights are CONST nodes in the DAG |
+| `(0xFF << s1) ^ mask` proof per byte | Not needed — constant folding IS the optimization |
+| 48 GB full-domain activation mmap LUTs | Not needed — LUT nodes implement silu/exp/rsqrt/cos/sin directly |
+| ArithmeticUnit for activations | Not needed — C executor implements them in C |
+
+### Phase A — `Fabric.from_pretrained()` (HuggingFace download)
+
+Add `Fabric.from_pretrained(model_name, save_dir)` classmethod:
+- Uses `transformers.AutoModelForCausalLM.from_pretrained()` for download
+- Extracts float32 weights directly (no Z3 decomposition)
+- Saves tokenizer via `AutoTokenizer.save_pretrained()`
+- Caches weights as `.npy` for instant reload (no torch after first run)
+- Same Fabric interface: `embed_tokens`, `layers`, `lm_head`, config attrs
+
+### Phase B — Wire into inference
+
+- Switch `JitSession` to `evaluate_c()` (C executor) instead of `evaluate()` (NumPy)
+- Add `--mode compile` CLI: `from_pretrained()` → `compile_model()` → `optimize_graph()` → `serialize()`
+- Add `--mode infer` CLI: tokenize → `JitSession.prefill()` → `decode_step()` loop → detokenize
+
+### Phase C — Remove legacy modules
+
+Delete:
+- `compiler.py` (Z3 gate synthesis)
+- `ops_compiler.py` (48 GB mmap LUTs)
+- `circuit_model.py` (legacy transformer)
+- `circuits.py` (ArithmeticUnit)
+
+Remove from `fabric.py`:
+- `_load_z3_gates()`, `_z3_reconstruct_weight()`
+
+Remove from dependencies:
+- `z3-solver`, `tqdm`
+
+### Phase D — Update tests
+
+- Extend `test_integration.py` with `from_pretrained` + inference tests
+- Remove tests for deleted modules
+- Update CLI tests for new mode names

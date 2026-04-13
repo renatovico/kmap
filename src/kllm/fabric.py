@@ -146,6 +146,40 @@ class Fabric:
                 self.layers[layer_idx][proj].T, dtype=np.float32)
         return self._t_cache[key]
 
+    def get_fused_qkv_t(self, layer_idx: int) -> np.ndarray:
+        """Return ``[Wq | Wk | Wv].T`` — fused QKV weight matrix.
+
+        Shape: (hidden_size, q_dim + kv_dim + kv_dim).
+        One matmul replaces three separate Q/K/V projections.
+        """
+        if not hasattr(self, "_fused_cache"):
+            self._fused_cache: dict[tuple[int, str], np.ndarray] = {}
+        key = (layer_idx, "qkv")
+        if key not in self._fused_cache:
+            q_t = self.get_transposed(layer_idx, "q_proj")
+            k_t = self.get_transposed(layer_idx, "k_proj")
+            v_t = self.get_transposed(layer_idx, "v_proj")
+            # q_t: (hidden, q_dim), k_t: (hidden, kv_dim), v_t: (hidden, kv_dim)
+            self._fused_cache[key] = np.ascontiguousarray(
+                np.concatenate([q_t, k_t, v_t], axis=1))
+        return self._fused_cache[key]
+
+    def get_fused_gate_up_t(self, layer_idx: int) -> np.ndarray:
+        """Return ``[Wgate | Wup].T`` — fused Gate+Up weight matrix.
+
+        Shape: (hidden_size, 2 * intermediate_size).
+        One matmul replaces two separate gate/up projections.
+        """
+        if not hasattr(self, "_fused_cache"):
+            self._fused_cache: dict[tuple[int, str], np.ndarray] = {}
+        key = (layer_idx, "gate_up")
+        if key not in self._fused_cache:
+            gate_t = self.get_transposed(layer_idx, "gate_proj")
+            up_t = self.get_transposed(layer_idx, "up_proj")
+            self._fused_cache[key] = np.ascontiguousarray(
+                np.concatenate([gate_t, up_t], axis=1))
+        return self._fused_cache[key]
+
     # ------------------------------------------------------------------
     # Class method: download from HuggingFace and cache
     # ------------------------------------------------------------------

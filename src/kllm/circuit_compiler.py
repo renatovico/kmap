@@ -83,10 +83,22 @@ def _attention_layer(
 ) -> tuple[int, int, int]:
     """Build attention subgraph.  Returns (output, new_k, new_v)."""
 
-    # Q/K/V projections
-    q = g.matmul(hidden, w["q_proj_t"], name=f"{name}/q_proj")
-    k = g.matmul(hidden, w["k_proj_t"], name=f"{name}/k_proj")
-    v = g.matmul(hidden, w["v_proj_t"], name=f"{name}/v_proj")
+    q_dim = num_heads * head_dim
+    kv_dim = num_kv_heads * head_dim
+
+    # Fused Q/K/V projection — one matmul replaces three
+    if "qkv_t" in w:
+        qkv = g.matmul(hidden, w["qkv_t"], name=f"{name}/qkv_proj")
+        q = g.slice(qkv, (slice(None), slice(0, q_dim)),
+                    name=f"{name}/q_split")
+        k = g.slice(qkv, (slice(None), slice(q_dim, q_dim + kv_dim)),
+                    name=f"{name}/k_split")
+        v = g.slice(qkv, (slice(None), slice(q_dim + kv_dim, None)),
+                    name=f"{name}/v_split")
+    else:
+        q = g.matmul(hidden, w["q_proj_t"], name=f"{name}/q_proj")
+        k = g.matmul(hidden, w["k_proj_t"], name=f"{name}/k_proj")
+        v = g.matmul(hidden, w["v_proj_t"], name=f"{name}/v_proj")
 
     # Reshape to (heads, seq, head_dim)
     q = g.reshape(q, (seq_len, num_heads, head_dim), name=f"{name}/q_reshape")
@@ -167,8 +179,17 @@ def _mlp_layer(
     name: str,
 ) -> int:
     """Build MLP subgraph: gate_proj → SiLU, up_proj, gate*up → down_proj."""
-    gate = g.matmul(hidden, w["gate_proj_t"], name=f"{name}/gate")
-    up = g.matmul(hidden, w["up_proj_t"], name=f"{name}/up")
+    if "gate_up_t" in w:
+        gate_up = g.matmul(hidden, w["gate_up_t"],
+                           name=f"{name}/gate_up_proj")
+        mid = w.get("_intermediate_size")
+        gate = g.slice(gate_up, (slice(None), slice(0, mid)),
+                       name=f"{name}/gate_split")
+        up = g.slice(gate_up, (slice(None), slice(mid, None)),
+                     name=f"{name}/up_split")
+    else:
+        gate = g.matmul(hidden, w["gate_proj_t"], name=f"{name}/gate")
+        up = g.matmul(hidden, w["up_proj_t"], name=f"{name}/up")
     gate_act = g.lut(gate, "silu", name=f"{name}/silu")
     gated = g.mul(gate_act, up, name=f"{name}/gate_up")
     return g.matmul(gated, w["down_proj_t"], name=f"{name}/down")
@@ -232,12 +253,16 @@ def compile_model(
     for li in range(f.num_layers):
         lw = f.layers[li]
         wn: dict[str, int] = {}
-        # Store transposed projections as constants (matmul uses A @ B)
-        for proj in ["q_proj", "k_proj", "v_proj", "o_proj",
-                      "gate_proj", "up_proj", "down_proj"]:
-            wn[f"{proj}_t"] = g.const(
-                f.get_transposed(li, proj),
-                name=f"L{li}/{proj}_t")
+        # Fused QKV and GateUp — one matmul replaces 2-3 separate ones
+        wn["qkv_t"] = g.const(
+            f.get_fused_qkv_t(li), name=f"L{li}/qkv_t")
+        wn["o_proj_t"] = g.const(
+            f.get_transposed(li, "o_proj"), name=f"L{li}/o_proj_t")
+        wn["gate_up_t"] = g.const(
+            f.get_fused_gate_up_t(li), name=f"L{li}/gate_up_t")
+        wn["down_proj_t"] = g.const(
+            f.get_transposed(li, "down_proj"), name=f"L{li}/down_proj_t")
+        wn["_intermediate_size"] = f.intermediate_size
         wn["input_ln_w"] = g.const(
             lw["input_layernorm_weight"].astype(np.float32),
             name=f"L{li}/input_ln_w")
@@ -385,11 +410,16 @@ def compile_decode_template(
     for li in range(f.num_layers):
         lw = f.layers[li]
         wn: dict[str, int] = {}
-        for proj in ["q_proj", "k_proj", "v_proj", "o_proj",
-                      "gate_proj", "up_proj", "down_proj"]:
-            wn[f"{proj}_t"] = g.const(
-                f.get_transposed(li, proj),
-                name=f"L{li}/{proj}_t")
+        # Fused QKV and GateUp — one matmul replaces 2-3 separate ones
+        wn["qkv_t"] = g.const(
+            f.get_fused_qkv_t(li), name=f"L{li}/qkv_t")
+        wn["o_proj_t"] = g.const(
+            f.get_transposed(li, "o_proj"), name=f"L{li}/o_proj_t")
+        wn["gate_up_t"] = g.const(
+            f.get_fused_gate_up_t(li), name=f"L{li}/gate_up_t")
+        wn["down_proj_t"] = g.const(
+            f.get_transposed(li, "down_proj"), name=f"L{li}/down_proj_t")
+        wn["_intermediate_size"] = f.intermediate_size
         wn["input_ln_w"] = g.const(
             lw["input_layernorm_weight"].astype(np.float32),
             name=f"L{li}/input_ln_w")

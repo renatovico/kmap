@@ -43,7 +43,7 @@ from kllm.circuit_compiler import (
     compile_model,
     _build_rope_const,
 )
-from kllm.circuit_executor import evaluate_c, precompute_consts
+from kllm.circuit_executor import evaluate_c, precompute_consts, ExecutionPlan
 from kllm.circuit_graph import CircuitGraph
 
 
@@ -67,6 +67,11 @@ class JitSession:
 
         # Pre-cache all CONST values so evaluate_c skips them each step.
         self._const_cache = precompute_consts(self._machine.graph)
+
+        # Pre-compile the execution plan — instruction tape with
+        # pre-resolved function pointers, pre-extracted params,
+        # CONST values pre-seeded.  run() just executes the tape.
+        self._plan = ExecutionPlan(self._machine.graph, self._const_cache)
 
         # Precomputed RoPE table (all positions up to max_seq)
         self._rope_cos, self._rope_sin = _build_rope_const(
@@ -139,10 +144,10 @@ class JitSession:
             inputs[m.input_ids[f"L{li}/cache_k"]] = k_cache
             inputs[m.input_ids[f"L{li}/cache_v"]] = v_cache
 
-        # Run the machine
-        values = evaluate_c(m.graph, inputs, const_cache=self._const_cache)
+        # Run the machine — pre-compiled instruction tape
+        values = self._plan.run(inputs)
 
-        # Extract outputs
+        # Extract outputs (values is a list indexed by node ID)
         logits = values[m.logits_id]
 
         # Update KV cache — new_k/new_v include the concat of old + new

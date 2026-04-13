@@ -211,6 +211,290 @@ _LUT_FN_MAP = {
 }
 
 # ---------------------------------------------------------------
+# Instruction tape tags
+# ---------------------------------------------------------------
+_T_LUT = 0
+_T_BINOP = 1
+_T_CMP_LE = 2
+_T_MUX = 3
+_T_NEG = 4
+_T_ABS = 5
+_T_SQUARE = 6
+_T_MATMUL = 7
+_T_REDUCE = 8
+_T_ARGMAX = 9
+_T_RESHAPE = 10
+_T_TRANSPOSE = 11
+_T_CONCAT = 12
+_T_REPEAT = 13
+_T_SLICE = 14
+_T_CAST = 15
+_T_EXPAND_DIMS = 16
+
+_BINOP_FN = {
+    Op.ADD: np.add,
+    Op.SUB: np.subtract,
+    Op.MUL: np.multiply,
+    Op.DIV: np.divide,
+    Op.MAX: np.maximum,
+}
+
+_REDUCE_FN = {
+    Op.SUM: np.sum,
+    Op.MAX_REDUCE: np.max,
+    Op.MEAN: np.mean,
+}
+
+# ---------------------------------------------------------------
+# ExecutionPlan — pre-compiled instruction tape
+# ---------------------------------------------------------------
+
+
+class ExecutionPlan:
+    """Pre-compiled execution plan for a CircuitGraph.
+
+    Walks the graph once at construction time and produces:
+
+    * A flat *values* list with CONST entries pre-seeded.
+    * A list of INPUT node IDs for fast runtime seeding.
+    * An instruction tape — each entry is a tuple with pre-resolved
+      function pointers, pre-extracted params, and integer node IDs.
+
+    ``run(inputs)`` copies the base list, seeds inputs, and executes
+    the tape.  No topological sort, no ``if/elif`` op dispatch by
+    enum, no ``node.params`` dict lookups at runtime.
+    """
+
+    __slots__ = ("_base_values", "_input_nids", "_tape", "_lib",
+                 "_num_nodes")
+
+    def __init__(self, graph: CircuitGraph,
+                 const_cache: dict[int, np.ndarray] | None = None) -> None:
+        lib = _get_lib()
+        self._lib = lib
+        n = len(graph.nodes)
+        self._num_nodes = n
+
+        const_cache = const_cache or {}
+
+        # Pre-seed CONST values into the base array
+        base: list[np.ndarray | None] = [None] * n
+        for node in graph.nodes:
+            if node.op == Op.CONST:
+                if node.id in const_cache:
+                    base[node.id] = const_cache[node.id]
+                else:
+                    base[node.id] = np.ascontiguousarray(
+                        node.params["value"])
+        self._base_values = base
+
+        # INPUT node IDs (for validation at runtime)
+        self._input_nids: list[int] = []
+
+        # Build the instruction tape
+        tape: list[tuple] = []
+        order = graph.topological_order()
+
+        for nid in order:
+            node = graph.nodes[nid]
+
+            if node.op == Op.CONST:
+                continue  # pre-seeded in base
+
+            if node.op == Op.INPUT:
+                self._input_nids.append(nid)
+                continue
+
+            ins = tuple(node.inputs)
+
+            if node.op == Op.LUT:
+                c_fn = getattr(lib, _LUT_FN_MAP[node.params["fn"]])
+                tape.append((_T_LUT, nid, ins[0], c_fn))
+
+            elif node.op in _BINOP_FN:
+                tape.append((_T_BINOP, nid, ins[0], ins[1],
+                             _BINOP_FN[node.op]))
+
+            elif node.op == Op.CMP_LE:
+                tape.append((_T_CMP_LE, nid, ins[0], ins[1]))
+
+            elif node.op == Op.MUX:
+                tape.append((_T_MUX, nid, ins[0], ins[1], ins[2]))
+
+            elif node.op == Op.NEG:
+                tape.append((_T_NEG, nid, ins[0]))
+
+            elif node.op == Op.ABS:
+                tape.append((_T_ABS, nid, ins[0]))
+
+            elif node.op == Op.SQUARE:
+                tape.append((_T_SQUARE, nid, ins[0]))
+
+            elif node.op == Op.MATMUL:
+                tape.append((_T_MATMUL, nid, ins[0], ins[1]))
+
+            elif node.op in _REDUCE_FN:
+                axis = node.params["axis"]
+                keepdims = node.params.get("keepdims", False)
+                tape.append((_T_REDUCE, nid, ins[0],
+                             _REDUCE_FN[node.op], axis, keepdims))
+
+            elif node.op == Op.ARGMAX:
+                tape.append((_T_ARGMAX, nid, ins[0],
+                             node.params["axis"]))
+
+            elif node.op == Op.RESHAPE:
+                tape.append((_T_RESHAPE, nid, ins[0],
+                             node.params["shape"]))
+
+            elif node.op == Op.TRANSPOSE:
+                tape.append((_T_TRANSPOSE, nid, ins[0],
+                             node.params["axes"]))
+
+            elif node.op == Op.CONCAT:
+                axis = node.params["axis"]
+                tape.append((_T_CONCAT, nid, ins, axis))
+
+            elif node.op == Op.REPEAT:
+                tape.append((_T_REPEAT, nid, ins[0],
+                             node.params["repeats"],
+                             node.params["axis"]))
+
+            elif node.op == Op.SLICE:
+                tape.append((_T_SLICE, nid, ins[0],
+                             node.params["slices"]))
+
+            elif node.op == Op.CAST:
+                tape.append((_T_CAST, nid, ins[0],
+                             node.params["dtype"]))
+
+            elif node.op == Op.EXPAND_DIMS:
+                tape.append((_T_EXPAND_DIMS, nid, ins[0],
+                             node.params["axis"]))
+
+            else:
+                raise ValueError(f"Unknown op: {node.op}")
+
+        self._tape = tape
+
+    def run(self, inputs: dict[int, np.ndarray]) -> list[np.ndarray | None]:
+        """Execute the plan.  Returns a list indexed by node ID."""
+        v = self._base_values.copy()  # shallow — shares numpy arrays
+
+        # Seed INPUT nodes
+        for nid in self._input_nids:
+            if nid not in inputs:
+                raise ValueError(f"Missing input for node {nid}")
+            v[nid] = np.ascontiguousarray(inputs[nid])
+
+        # Execute the instruction tape
+        for instr in self._tape:
+            tag = instr[0]
+
+            if tag == _T_BINOP:
+                # (tag, nid, i0, i1, np_fn)
+                v[instr[1]] = instr[4](
+                    np.asarray(v[instr[2]], dtype=np.float32),
+                    np.asarray(v[instr[3]], dtype=np.float32))
+
+            elif tag == _T_MATMUL:
+                # (tag, nid, i0, i1)
+                v[instr[1]] = np.matmul(
+                    np.ascontiguousarray(v[instr[2]], dtype=np.float32),
+                    np.ascontiguousarray(v[instr[3]], dtype=np.float32))
+
+            elif tag == _T_LUT:
+                # (tag, nid, i0, c_fn)
+                x = np.ascontiguousarray(v[instr[2]], dtype=np.float32)
+                out = np.empty_like(x)
+                instr[3](_to_c_float(out), _to_c_float(x), x.size)
+                v[instr[1]] = out
+
+            elif tag == _T_RESHAPE:
+                # (tag, nid, i0, shape)
+                v[instr[1]] = np.ascontiguousarray(
+                    v[instr[2]]).reshape(instr[3])
+
+            elif tag == _T_TRANSPOSE:
+                # (tag, nid, i0, axes)
+                v[instr[1]] = np.ascontiguousarray(
+                    np.transpose(v[instr[2]], axes=instr[3]),
+                    dtype=np.float32)
+
+            elif tag == _T_CONCAT:
+                # (tag, nid, input_nids, axis)
+                axis = instr[3]
+                arrays = [np.ascontiguousarray(v[i], dtype=np.float32)
+                          for i in instr[2]]
+                if axis < 0:
+                    axis = arrays[0].ndim + axis
+                v[instr[1]] = np.concatenate(arrays, axis=axis)
+
+            elif tag == _T_SLICE:
+                # (tag, nid, i0, slices)
+                v[instr[1]] = np.ascontiguousarray(
+                    np.asarray(v[instr[2]], dtype=np.float32)[instr[3]])
+
+            elif tag == _T_REDUCE:
+                # (tag, nid, i0, np_fn, axis, keepdims)
+                v[instr[1]] = instr[3](
+                    np.asarray(v[instr[2]], dtype=np.float32),
+                    axis=instr[4], keepdims=instr[5])
+
+            elif tag == _T_NEG:
+                # (tag, nid, i0)
+                v[instr[1]] = -np.asarray(v[instr[2]], dtype=np.float32)
+
+            elif tag == _T_SQUARE:
+                # (tag, nid, i0)
+                x = np.asarray(v[instr[2]], dtype=np.float32)
+                v[instr[1]] = x * x
+
+            elif tag == _T_REPEAT:
+                # (tag, nid, i0, repeats, axis)
+                v[instr[1]] = np.repeat(
+                    np.asarray(v[instr[2]], dtype=np.float32),
+                    instr[3], axis=instr[4])
+
+            elif tag == _T_EXPAND_DIMS:
+                # (tag, nid, i0, axis)
+                v[instr[1]] = np.expand_dims(
+                    np.ascontiguousarray(v[instr[2]]), axis=instr[3])
+
+            elif tag == _T_MUX:
+                # (tag, nid, cond, a, b)
+                cond = np.asarray(v[instr[2]], dtype=np.float32)
+                v[instr[1]] = np.where(
+                    cond != 0.0,
+                    np.asarray(v[instr[4]], dtype=np.float32),
+                    np.asarray(v[instr[3]], dtype=np.float32))
+
+            elif tag == _T_CMP_LE:
+                # (tag, nid, i0, i1)
+                v[instr[1]] = (
+                    np.asarray(v[instr[2]], dtype=np.float32)
+                    <= np.asarray(v[instr[3]], dtype=np.float32)
+                ).astype(np.uint8)
+
+            elif tag == _T_ABS:
+                # (tag, nid, i0)
+                v[instr[1]] = np.abs(
+                    np.asarray(v[instr[2]], dtype=np.float32))
+
+            elif tag == _T_ARGMAX:
+                # (tag, nid, i0, axis)
+                v[instr[1]] = np.argmax(
+                    np.asarray(v[instr[2]], dtype=np.float32),
+                    axis=instr[3])
+
+            elif tag == _T_CAST:
+                # (tag, nid, i0, dtype)
+                v[instr[1]] = np.asarray(v[instr[2]]).astype(instr[3])
+
+        return v
+
+
+# ---------------------------------------------------------------
 # Const pre-caching
 # ---------------------------------------------------------------
 

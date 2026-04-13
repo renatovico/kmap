@@ -76,6 +76,17 @@ class MockFabric:
                 self.layers[layer_idx][proj].T, dtype=np.float32)
         return self._t_cache[key]
 
+    def get_fused_qkv_t(self, layer_idx):
+        q_t = self.get_transposed(layer_idx, 'q_proj')
+        k_t = self.get_transposed(layer_idx, 'k_proj')
+        v_t = self.get_transposed(layer_idx, 'v_proj')
+        return np.ascontiguousarray(np.concatenate([q_t, k_t, v_t], axis=1))
+
+    def get_fused_gate_up_t(self, layer_idx):
+        gate_t = self.get_transposed(layer_idx, 'gate_proj')
+        up_t = self.get_transposed(layer_idx, 'up_proj')
+        return np.ascontiguousarray(np.concatenate([gate_t, up_t], axis=1))
+
 
 @pytest.fixture
 def fabric():

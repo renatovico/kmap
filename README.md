@@ -175,7 +175,7 @@ src/kllm/
 ├── circuit_executor.py # C-accelerated graph evaluator (ctypes wrapper)
 ├── graph_optimizer.py # DAG-level constant folding + dead elimination
 ├── jit_optimizer.py  # Per-token JIT optimization with KV cache folding
-└── hdl_export.py     # (planned) Gate graph → Verilog / VHDL
+└── hdl_export.py     # Gate graph → Verilog / VHDL / testbench / resource estimation
 
 csrc/
 └── _circuit_eval.c   # C tensor ops library (all primitive ops for the graph)
@@ -184,7 +184,7 @@ csrc/
 ## Running tests
 
 ```bash
-pytest          # 222 tests
+pytest          # 251 tests
 ```
 
 ## Current status
@@ -206,7 +206,7 @@ full roadmap toward the complete gate-circuit architecture.
 | C gate executor (zero NumPy runtime) | ✅ Phase 4 |
 | Offline graph optimisation | ✅ Phase 5 |
 | Online JIT per-token optimisation | ✅ Phase 6 |
-| FPGA export (Verilog/VHDL) | 🔲 Phase 7 |
+| FPGA export (Verilog/VHDL) | ✅ Phase 7 |
 
 ## Compiled output layout
 

@@ -424,24 +424,44 @@ pytest tests/test_jit_optimizer.py  # 15 passed
 
 ---
 
-## Phase 7 — FPGA export
+## Phase 7 — FPGA export  ✅ DONE
 
 **Goal**: emit optimised gate graph as synthesisable HDL.
 
-### New module: `hdl_export.py`
+### Implementation: `hdl_export.py`
 
-| Feature | Description |
+| Feature | Status |
 |---|---|
-| **Verilog emitter** | `CircuitGraph` → `.v` with LUT instantiations |
-| **VHDL emitter** | Xilinx/Altera alternative |
-| **Testbench generator** | Z3 proofs → SystemVerilog assertions |
-| **Pipelining** | Register stages at subgraph boundaries |
+| **Verilog emitter** | ✅ `export_verilog()` — structural RTL with FPU module instantiations |
+| **VHDL emitter** | ✅ `export_vhdl()` — entity/architecture with function calls |
+| **Testbench generator** | ✅ `export_testbench()` — SystemVerilog with golden value checks |
+| **Pipeline registers** | ✅ Configurable `pipeline_depth` parameter |
+| **Resource estimation** | ✅ `estimate_resources()` — LUTs, FFs, BRAMs, DSPs per target |
+
+Node mapping:
+- **CONST** → wire assignment (constant hex pattern)
+- **Arithmetic** (add/sub/mul/div) → `fp_*` module instances (vendor IP or behavioral)
+- **NEG/ABS** → bitwise XOR/AND (sign bit manipulation)
+- **LUT** (silu/exp/rsqrt/cos/sin) → `lut_*` BRAM ROM modules
+- **MATMUL** → `fp_matmul` module instance
+- **Reductions** → `reduce_*` tree modules
+- **Wiring** (reshape/transpose/slice) → direct wire assignment (zero logic)
+
+Helper modules emitted as behavioral Verilog for simulation.
+Replace with vendor IP (Xilinx Floating Point, Intel FP) for synthesis.
 
 ### Target platforms
 
-- Xilinx Alveo / Zynq (LUT6)
-- Intel/Altera Stratix / Cyclone (ALM)
-- Lattice iCE40 via Yosys/nextpnr
+- Xilinx Alveo / Zynq (LUT6): uses BRAM18/36 for activation LUTs
+- Intel/Altera Stratix / Cyclone (ALM): uses M20K for activation LUTs
+- Lattice iCE40 via Yosys/nextpnr: uses SPRAM
+
+### Verification
+
+```bash
+pytest tests/test_hdl_export.py  # 27 passed
+# Verilog/VHDL structure valid, all ops represented, golden testbench
+```
 
 ---
 

@@ -155,7 +155,7 @@ class Fabric:
 
         print(f"[*] Loading {model_name} …")
         model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=torch.float32,
+            model_name, dtype=torch.float32,
         )
         config = model.config
 

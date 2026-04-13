@@ -89,9 +89,10 @@ def main(argv: list[str] | None = None) -> None:
 
         text = _get_text(args)
         messages = [{"role": "user", "content": text}]
-        token_ids = tokenizer.apply_chat_template(
+        prompt_str = tokenizer.apply_chat_template(
             messages, add_generation_prompt=True,
         )
+        token_ids = tokenizer.encode(prompt_str)
 
         session = JitSession(fabric)
         logits = session.prefill(token_ids)

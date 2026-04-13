@@ -65,10 +65,15 @@ def compare_generate(
     from kllm.tokenizer import Tokenizer as KllmTokenizer
 
     tok_dir = os.path.join(save_dir, "tokenizer")
+    if not os.path.isdir(tok_dir):
+        print("[compare] Weights not cached — running Fabric.from_pretrained …")
+        Fabric.from_pretrained(model_name, save_dir)
+
     kllm_tok = KllmTokenizer(tok_dir)
-    token_ids = kllm_tok.apply_chat_template(
+    prompt_str = kllm_tok.apply_chat_template(
         messages, add_generation_prompt=True,
     )
+    token_ids = kllm_tok.encode(prompt_str)
 
     fabric = Fabric(save_dir)
     session = JitSession(fabric)

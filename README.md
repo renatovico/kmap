@@ -1,47 +1,74 @@
 # kllm
 
-Z3 Universal Computing Engine for LLM Inference.
+**Boolean Logic Synthesis for LLM Inference.**
 
-**kllm** treats the Z3 SMT solver as a **universal computing machine**.
-Every operation in a transformer — weight storage, matrix multiply,
-RMSNorm, RoPE, SiLU, softmax — is compiled into Z3-proved boolean
-gates expressed as `(input << shift) ^ mask`.  At inference time the
-entire pipeline runs through pure shift + XOR operations.  No floating-
-point unit is used.  Zero precision loss.
+kllm uses the Z3 SMT solver to **compile** a transformer model into
+boolean circuits.  Every float32 weight and every activation function
+(SiLU, exp, rsqrt) is decomposed into byte-level lookup tables that
+Z3 proves correct.  At inference time, the entire pipeline runs on
+**pure NumPy** — no torch, no FPU instructions — using only shift, XOR,
+and array indexing.  The result is **bit-exact** to HuggingFace output.
 
-## Key ideas
+This is not quantization.  No precision is lost.  Every bit of every
+original float32 weight is preserved through a change of
+**representation**, not a change of value.
 
-| Concept | Traditional (FP32) | kllm (Z3 Gate Fabric) |
+## The core idea
+
+A 32-bit float is 4 bytes.  Each byte can only take one of 256 values.
+Z3 can prove, for every possible byte value, a constant gate of the form:
+
+$$\text{target} = (0\text{xFF} \ll s_1) \oplus \text{mask}$$
+
+where $s_1 \in [0, 7]$ and $\text{mask} \in [0, 255]$.  This yields two
+256-entry lookup tables (one for shifts, one for masks) that reconstruct
+**any** byte via a single shift and a single XOR.
+
+**Weights** are stored as 4 byte-plane indices per float32.  At load time,
+the gate LUTs execute `(0xFF << s1_lut[b]) ^ mask_lut[b]` for each byte
+and reassemble the original float32 — lossless, no floating-point math.
+
+**Activation functions** (SiLU, exp, rsqrt) use the same principle but
+scaled to the entire float32 domain: for every one of the $2^{32}$
+possible input bit patterns, the output is pre-computed and stored as
+4 byte-plane files (~4 GB each).  At runtime, activations are a single
+array index into a memory-mapped file — O(1) per value.
+
+### Why this works
+
+| Concept | Traditional approach | kllm |
 |---|---|---|
-| Weight storage | VRAM tensors | 4 × `(s1, mask)` constant gates |
-| Activation fns | FPU (SiLU, exp, rsqrt) | Full-domain byte-plane maps (mmap) |
-| Data path | float32 arithmetic | shift + XOR (boolean gates) |
-| Precision | Lossy if quantised | **Lossless** (bit-exact to HuggingFace) |
-| HF dependency | Yes (torch, transformers) | **None** at inference (numpy only) |
+| Weight storage | float32 tensors in VRAM | 4 byte-plane indices → gate LUT → float32 |
+| Activation fns | FPU (SiLU, exp, rsqrt) | Full-domain byte-plane maps (mmap lookup) |
+| Data path | float32 arithmetic | shift + XOR + array index |
+| Precision | Lossy if quantised | **Lossless** — bit-exact to HuggingFace |
+| Runtime deps | torch, transformers, CUDA | **numpy only** |
 
-### Two compilation stages
+### Three compilation stages
 
-1. **Weight compilation** (`kllm --mode compile`) — decomposes every
-   float32 weight into 4 IEEE-754 byte planes.  Z3 proves
-   `(0xFF << s1) ^ mask == target` for all 256 byte values.  Stored as
-   `.npz` gate arrays per layer.
+1. **Weight compilation** (`kllm --mode compile`) — loads HuggingFace
+   weights, decomposes every float32 into 4 IEEE-754 byte planes, and
+   runs Z3 to prove a `(shift, mask)` gate for all 256 byte values.
+   Result: `.npz` gate arrays per layer.
 
 2. **Circuit compilation** (`kllm --mode compile-circuits`) — evaluates
-   SiLU, exp, and rsqrt for **every possible float32 bit pattern**
-   (all 2^32 values).  Each output is decomposed into 4 byte planes
-   and written to disk as 4 GB binary files (12 files, ~48 GB total).
-   At runtime these are memory-mapped — the OS pages in only what the
-   model actually touches.  This is the same 4-plane strategy used for
-   weight storage, now applied to activation functions.
+   SiLU, exp, and rsqrt for **all $2^{32}$ float32 bit patterns**.
+   Each output is split into 4 byte planes and written as ~4 GB binary
+   files (12 files, ~48 GB total).  Memory-mapped at runtime — the OS
+   pages in only what the model touches.
+
+3. **Optimisation** (`kllm --mode optimize`) — applies Quine-McCluskey
+   boolean minimisation to the gate LUTs (8 inputs → 8 outputs) and
+   materialises pre-computed float32 weight files for instant mmap
+   loading, bypassing gate execution entirely.
 
 ### Why full-domain?
 
-The Z3 solver proves a gate for each byte value.  By pre-computing
-every possible float32 input, no value can ever be "unseen" — every
-prompt, every temperature, every token produces activation values that
-are already in the compiled tables.  Lookup is O(1) array indexing
-into an mmap'd file.  No hash tables, no on-demand compilation, no
-fallback.
+Pre-computing every possible float32 input means no value is ever
+"unseen".  Every prompt, every temperature, every token produces
+activation values that already exist in the compiled tables.  There is
+no hash table, no on-demand compilation, no fallback — just a single
+array index per value.
 
 ## Installation
 
@@ -111,6 +138,7 @@ src/kllm/
 ├── bitops.py         # Lossless IEEE-754 byte-plane extract / repack
 ├── compiler.py       # Z3 weight gate synthesis (compile mode)
 ├── ops_compiler.py   # Full-domain activation circuit compilation
+├── optimizer.py      # Quine-McCluskey boolean minimisation + weight materialisation
 ├── circuits.py       # Z3 gate primitives + ArithmeticUnit (mmap byte planes)
 ├── circuit_model.py  # LLaMA transformer with Z3 circuit execution + streaming
 ├── fabric.py         # Gate loader — shift+XOR → float32 weight matrices
@@ -127,6 +155,7 @@ tests/
 ├── test_compare.py
 ├── test_compiler.py
 ├── test_device.py
+├── test_optimizer.py
 └── test_tokenizer.py
 ```
 
@@ -143,37 +172,40 @@ pytest          # 68 tests
  │                    COMPILE TIME (one-time)                │
  └──────────────────────────────────────────────────────────┘
 
-  HuggingFace          Z3 Solver            Disk
-  ───────────          ─────────            ────
-  float32 weights ──▶ .view(uint32) ──▶ 4 byte planes (m0-m3)
-                       Z3: (0xFF << s1) ^ mask == target
-                       ──▶ (s1, mask) per byte value
-                       ──▶ layer_N.npz  (gate fabric)
+  HuggingFace weights        Z3 Solver              Disk
+  ───────────────────        ─────────              ────
+  float32 per weight  ──▶  .view(uint32)  ──▶  4 byte planes (m0-m3)
+                           Z3: (0xFF << s1) ^ mask == target
+                           ──▶ 256-entry (s1, mask) LUTs
+                           ──▶ layer_N.npz  (gate fabric)
 
-  SiLU / exp / rsqrt   for all 2^32 float32 bit patterns:
-                        fn(x) → 4 output bytes → index const LUT
-                       ──▶ {op}_p{0-3}.bin  (4 GB each, 12 files)
+  SiLU / exp / rsqrt        NumPy eval              Disk
+  ──────────────────        ──────────              ────
+  for all 2^32 inputs ──▶  fn(x) → 4 bytes  ──▶  {op}_p{0-3}.bin
+                            (one per byte plane)    (4 GB each, 12 files)
 
  ┌──────────────────────────────────────────────────────────┐
  │               INFERENCE (numpy only, no torch)           │
  └──────────────────────────────────────────────────────────┘
 
   ┌─────────────┐
-  │   Fabric    │  shift+XOR gates → float32 weight matrices
-  │  (10s load) │  cached in RAM, gate arrays discarded
+  │   Fabric    │  Three load paths:
+  │  (weights)  │  1. gate LUTs: shift+XOR → float32 (default)
+  │             │  2. optimized/: pre-computed float32 mmap (fast)
   └──────┬──────┘
          │
          ▼
   ┌─────────────┐
-  │  Circuits   │  mmap 12 byte-plane files (48 GB on disk)
-  │  (mmap'd)   │  OS pages in only what's accessed (~MBs)
+  │  Circuits   │  Activation functions:
+  │ (SiLU, exp, │  Z3-verified NumPy formulas (SIMD, fast path)
+  │   rsqrt)    │  — or mmap byte-plane files (full-domain fallback)
   └──────┬──────┘
          │
          ▼
   ┌─────────────┐
   │ Transformer │  RMSNorm → Q,K,V → RoPE → Attention → MLP
-  │  (per layer)│  activations: idx = x.view(uint32)
-  │             │  out_byte = plane_file[idx]  ← O(1) mmap lookup
+  │  (per layer)│  matmul on reconstructed float32 weights
+  │             │  activations via circuit lookup
   └──────┬──────┘
          │
          ▼

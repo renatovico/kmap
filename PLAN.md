@@ -295,29 +295,52 @@ pytest tests/test_circuit_compiler.py   # 11 tests
 
 ---
 
-## Phase 4 — C gate executor
+## Phase 4 — C gate executor  ✅ DONE
 
 **Goal**: replace the Python/NumPy circuit evaluator with a compiled
 C extension — zero NumPy at inference time.
 
-### New module: `_circuit_eval.c`
+### Implementation
 
-```c
-// Walk DAG nodes in topological order
-// Each node: read input bytes → LUT[input] → write output bytes
-// Pure integer: <<, ^, array index
-// Compile: cc -O3 -shared -fPIC -march=native -o _circuit_eval.so
+| File | Purpose |
+|---|---|
+| `csrc/_circuit_eval.c` | C shared library — ~500 lines implementing all primitive tensor ops |
+| `src/kllm/circuit_executor.py` | Python ctypes wrapper — `evaluate_c()` replaces `evaluate()` |
+| `tests/test_c_executor.py` | 38 tests — every op + composites + full compiled model |
+
+**C ops implemented** (all match NumPy reference bit-for-bit):
+- **Arithmetic**: add, sub, mul, div (with full broadcasting)
+- **Unary**: neg (sign XOR), abs (sign AND), square
+- **LUT activations**: silu, exp, rsqrt, cos, sin (upcast to float64)
+- **Comparison**: cmp_le, mux (conditional select)
+- **Matmul**: arbitrary-dimension batched ((...,m,k) @ (...,k,n))
+- **Reductions**: sum, max_reduce, mean, argmax (along any axis)
+- **Wiring**: transpose, repeat, slice, copy (reshape/expand_dims)
+
+**Architecture**: Python evaluation loop (trivial overhead) dispatches
+each tensor op to C via ctypes.  NumPy arrays serve as containers;
+all computation is in C.
+
+```bash
+# Compile
+cc -O3 -shared -fPIC -march=native -o csrc/_circuit_eval.so csrc/_circuit_eval.c -lm
+
+# Auto-compiles if .so is missing
+from kllm.circuit_executor import evaluate_c
+values = evaluate_c(graph)  # same API as evaluate()
 ```
 
-- Python wrapper loads serialised `CircuitGraph`, calls into C
-- Token IDs in, logit bytes out
-- Memory-mapped LUT files (same mmap as current circuits)
-- OpenMP parallelism across independent subgraphs (attention heads)
+### Graph serialization
+
+CircuitGraph now supports `serialize(path)` / `deserialize(path)`:
+- `nodes.bin`: packed node descriptors (op, inputs, params)
+- `topo.bin`: topological order (uint32 array)
+- `const_NNN.bin` + `.json`: raw tensor data + shape/dtype metadata
 
 ### Verification
 
 ```bash
-pytest tests/test_c_executor.py
+pytest tests/test_c_executor.py  # 38 passed
 # C executor output == Python CircuitGraph.evaluate()
 ```
 

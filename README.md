@@ -172,14 +172,18 @@ src/kllm/
 ├── binary_ops.py     # IEEE-754 reference implementations (golden model for executor)
 ├── circuit_graph.py  # DAG of gate nodes — circuit builder + reference evaluator
 ├── circuit_compiler.py # Compile LLaMA transformer into a CircuitGraph
+├── circuit_executor.py # C-accelerated graph evaluator (ctypes wrapper)
 ├── jit_optimizer.py  # (planned) Per-token circuit specialisation
 └── hdl_export.py     # (planned) Gate graph → Verilog / VHDL
+
+csrc/
+└── _circuit_eval.c   # C tensor ops library (all primitive ops for the graph)
 ```
 
 ## Running tests
 
 ```bash
-pytest          # 68 tests
+pytest          # 184 tests
 ```
 
 ## Current status
@@ -198,7 +202,7 @@ full roadmap toward the complete gate-circuit architecture.
 | Circuit graph DAG + reference evaluator | ✅ Phase 2 |
 | cos/sin activation LUTs + float64 support | 🔲 Phase 2 (cos/sin compile pending) |
 | Transformer → circuit graph compilation | ✅ Phase 3 |
-| C gate executor (zero NumPy runtime) | 🔲 Phase 4 |
+| C gate executor (zero NumPy runtime) | ✅ Phase 4 |
 | Offline graph optimisation | 🔲 Phase 5 |
 | Online JIT per-token optimisation | 🔲 Phase 6 |
 | FPGA export (Verilog/VHDL) | 🔲 Phase 7 |

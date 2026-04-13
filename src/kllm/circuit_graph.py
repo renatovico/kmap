@@ -327,6 +327,156 @@ class CircuitGraph:
             counts["total"] += 1
         return counts
 
+    # ---- Serialization ------------------------------------------
+
+    def serialize(self, path: str) -> None:
+        """Serialize the graph to a directory of flat files.
+
+        Format (designed for C consumption):
+        - ``nodes.bin``: packed node descriptors
+        - ``topo.bin``: topological order (uint32 array)
+        - ``const_NNN.bin``: raw tensor data for each const node
+        """
+        import os
+        import struct
+        os.makedirs(path, exist_ok=True)
+        order = self.topological_order()
+
+        # Op enum → integer mapping
+        op_map = {op: i for i, op in enumerate(Op)}
+
+        with open(os.path.join(path, "nodes.bin"), "wb") as f:
+            # Header: num_nodes (uint32)
+            f.write(struct.pack("<I", len(self.nodes)))
+            for node in self.nodes:
+                # node_id, op, num_inputs
+                f.write(struct.pack("<III",
+                                    node.id, op_map[node.op],
+                                    len(node.inputs)))
+                # input IDs
+                for inp in node.inputs:
+                    f.write(struct.pack("<I", inp))
+                # Params: encode as key=value pairs, terminated by \0
+                param_bytes = _encode_params(node.params)
+                f.write(struct.pack("<I", len(param_bytes)))
+                f.write(param_bytes)
+
+        # Topological order
+        order_arr = np.array(order, dtype=np.uint32)
+        order_arr.tofile(os.path.join(path, "topo.bin"))
+
+        # Constant tensor data
+        for node in self.nodes:
+            if node.op == Op.CONST and "value" in node.params:
+                val = np.ascontiguousarray(node.params["value"])
+                val.tofile(os.path.join(path, f"const_{node.id}.bin"))
+                # Also save shape/dtype metadata
+                meta = {
+                    "shape": list(val.shape),
+                    "dtype": str(val.dtype),
+                }
+                import json
+                with open(os.path.join(path, f"const_{node.id}.json"),
+                          "w") as mf:
+                    json.dump(meta, mf)
+
+    @classmethod
+    def deserialize(cls, path: str) -> "CircuitGraph":
+        """Load a graph from a serialized directory."""
+        import os
+        import struct
+        import json
+
+        g = cls()
+        op_list = list(Op)
+
+        with open(os.path.join(path, "nodes.bin"), "rb") as f:
+            num_nodes = struct.unpack("<I", f.read(4))[0]
+            for _ in range(num_nodes):
+                nid, op_idx, num_inputs = struct.unpack("<III", f.read(12))
+                inputs = [struct.unpack("<I", f.read(4))[0]
+                          for _ in range(num_inputs)]
+                param_len = struct.unpack("<I", f.read(4))[0]
+                param_bytes = f.read(param_len)
+                params = _decode_params(param_bytes)
+
+                op = op_list[op_idx]
+
+                # Load const data
+                if op == Op.CONST:
+                    const_path = os.path.join(path, f"const_{nid}.bin")
+                    meta_path = os.path.join(path, f"const_{nid}.json")
+                    if os.path.exists(const_path):
+                        with open(meta_path) as mf:
+                            meta = json.load(mf)
+                        dtype = np.dtype(meta["dtype"])
+                        shape = tuple(meta["shape"])
+                        data = np.fromfile(const_path, dtype=dtype)
+                        params["value"] = data.reshape(shape)
+
+                node = Node(id=nid, op=op, inputs=inputs, params=params)
+                g.nodes.append(node)
+                g._next_id = max(g._next_id, nid + 1)
+
+        return g
+
+
+def _encode_params(params: dict) -> bytes:
+    """Encode params dict to bytes for serialization."""
+    import json
+    # Filter out numpy arrays (handled separately for const nodes)
+    filtered = {}
+    for k, v in params.items():
+        if isinstance(v, np.ndarray):
+            continue
+        if isinstance(v, np.dtype):
+            filtered[k] = str(v)
+        elif isinstance(v, (np.integer, np.floating)):
+            filtered[k] = v.item()
+        elif isinstance(v, slice):
+            filtered[k] = {"__slice__": [v.start, v.stop, v.step]}
+        elif isinstance(v, tuple) and any(isinstance(i, slice) for i in v):
+            encoded = []
+            for item in v:
+                if isinstance(item, slice):
+                    encoded.append({"__slice__": [item.start, item.stop,
+                                                  item.step]})
+                else:
+                    encoded.append(item)
+            filtered[k] = {"__tuple_slices__": encoded}
+        else:
+            filtered[k] = v
+    return json.dumps(filtered).encode("utf-8")
+
+
+def _decode_params(data: bytes) -> dict:
+    """Decode params from bytes."""
+    import json
+    if not data:
+        return {}
+    params = json.loads(data.decode("utf-8"))
+    # Reconstruct special types
+    for k, v in list(params.items()):
+        if isinstance(v, dict) and "__slice__" in v:
+            s = v["__slice__"]
+            params[k] = slice(s[0], s[1], s[2])
+        elif isinstance(v, dict) and "__tuple_slices__" in v:
+            items = []
+            for item in v["__tuple_slices__"]:
+                if isinstance(item, dict) and "__slice__" in item:
+                    s = item["__slice__"]
+                    items.append(slice(s[0], s[1], s[2]))
+                else:
+                    items.append(item)
+            params[k] = tuple(items)
+        elif k == "dtype":
+            params[k] = np.dtype(v)
+        elif k == "shape" and isinstance(v, list):
+            params[k] = tuple(v)
+        elif k == "axes" and isinstance(v, list):
+            params[k] = tuple(v)
+    return params
+
 
 # ---------------------------------------------------------------
 # Reference evaluator — golden output via NumPy

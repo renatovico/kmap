@@ -2,7 +2,7 @@
 
 Runs the same prompt through:
   1. HuggingFace ``AutoModelForCausalLM`` with greedy decoding
-  2. kllm ``JitSession`` — circuit graph inference via C executor
+  2. kllm ``Chip`` — compiled processor inference
 
 and prints a side-by-side report of generated text and timing.
 """
@@ -14,20 +14,63 @@ import numpy as np
 import torch
 
 
-def compare_generate(
-    model_name: str,
-    save_dir: str,
-    text: str,
+# Standard benchmark prompts (short, medium, long)
+_BENCHMARK_PROMPTS = [
+    "Hello",
+    "What is the capital of France?",
+    "Explain quantum computing in simple terms for a beginner.",
+]
+
+
+def compare_chip(
+    chip: object,
+    text: str | None = None,
     max_tokens: int = 50,
 ) -> dict:
-    """Compare HuggingFace pipeline vs kllm engine for text generation.
+    """Compare chip inference vs HuggingFace for text generation.
 
-    *text* is treated as a user message in a chat template.
+    If *text* is None, runs a standard benchmark suite
+    (multiple prompts). Otherwise compares the single prompt.
     """
+    from kllm.chip import Chip
+
+    # Read model_name from chip metadata
+    import json
+    with open(os.path.join(chip.path, "chip.json")) as f:
+        meta = json.load(f)
+    model_name = meta["model_name"]
+
+    prompts = [text] if text else _BENCHMARK_PROMPTS
+
+    results = []
+    for prompt in prompts:
+        stats = _compare_single(chip, model_name, prompt, max_tokens)
+        results.append(stats)
+
+    if len(results) == 1:
+        return results[0]
+
+    # Aggregate summary for benchmark suite
+    return {
+        "benchmark": True,
+        "results": results,
+        "avg_hf_time_s": sum(r["hf_time_s"] for r in results) / len(results),
+        "avg_kllm_time_s": sum(r["kllm_time_s"] for r in results) / len(results),
+    }
+
+
+def _compare_single(
+    chip: object,
+    model_name: str,
+    text: str,
+    max_tokens: int,
+) -> dict:
+    """Compare a single prompt: HF vs chip."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    # ---- HuggingFace (manual greedy decode) ----
     messages = [{"role": "user", "content": text}]
+
+    # ---- HuggingFace ----
     hf_tok = AutoTokenizer.from_pretrained(model_name)
     hf_model = AutoModelForCausalLM.from_pretrained(
         model_name, dtype=torch.float32,
@@ -59,37 +102,10 @@ def compare_generate(
     del hf_model
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
-    # ---- kllm engine (circuit graph + C executor) ----
-    from kllm.fabric import Fabric
-    from kllm.jit_optimizer import JitSession
-    from kllm.tokenizer import Tokenizer as KllmTokenizer
-
-    tok_dir = os.path.join(save_dir, "tokenizer")
-    if not os.path.isdir(tok_dir):
-        print("[compare] Weights not cached — running Fabric.from_pretrained …")
-        Fabric.from_pretrained(model_name, save_dir)
-
-    kllm_tok = KllmTokenizer(tok_dir)
-    prompt_str = kllm_tok.apply_chat_template(
-        messages, add_generation_prompt=True,
-    )
-    token_ids = kllm_tok.encode(prompt_str)
-
-    fabric = Fabric(save_dir)
-    session = JitSession(fabric)
-
+    # ---- kllm chip ----
     t0 = time.perf_counter()
-    logits = session.prefill(token_ids)
-    generated: list[int] = []
-    for _ in range(max_tokens):
-        next_id = int(np.argmax(logits[-1]))
-        if next_id == kllm_tok.eos_token_id:
-            break
-        generated.append(next_id)
-        logits = session.decode_step(next_id)
+    kllm_output = chip.infer(text, max_tokens)
     kllm_time = time.perf_counter() - t0
-
-    kllm_output = kllm_tok.decode(generated, skip_special_tokens=True)
 
     return {
         "text": text,
@@ -104,8 +120,23 @@ def compare_generate(
 def print_generate_report(stats: dict) -> None:
     """Pretty-print generation comparison report."""
     w = 64
+
+    if stats.get("benchmark"):
+        print("\n" + "=" * w)
+        print("  kllm — Benchmark Suite: Chip vs HuggingFace")
+        print("=" * w)
+        for i, r in enumerate(stats["results"], 1):
+            print(f"\n  [{i}] Prompt: {r['text']!r}")
+            print(f"      HF  ({r['hf_time_s']:.2f}s): {r['hf_output'][:60]}")
+            print(f"      kllm({r['kllm_time_s']:.2f}s): {r['kllm_output'][:60]}")
+        print("-" * w)
+        print(f"  Average: HF={stats['avg_hf_time_s']:.2f}s  "
+              f"kllm={stats['avg_kllm_time_s']:.2f}s")
+        print("=" * w)
+        return
+
     print("\n" + "=" * w)
-    print("  kllm — HuggingFace vs Circuit Graph Engine")
+    print("  kllm — HuggingFace vs Chip Processor")
     print("=" * w)
     print(f"  Prompt     : {stats['text']!r}")
     print(f"  Max tokens : {stats['max_tokens']}")

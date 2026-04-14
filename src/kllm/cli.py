@@ -21,12 +21,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--mode",
-        choices=["compile", "infer", "compare", "export-hdl"],
+        choices=["compile", "infer", "compare", "export-hdl", "simulate"],
         required=True,
         help="compile: download model + build circuit graph · "
         "infer: autoregressive text generation via circuit graph · "
         "compare: HuggingFace vs kllm · "
-        "export-hdl: export circuit graph to Verilog/VHDL",
+        "export-hdl: export circuit graph to Verilog/VHDL · "
+        "simulate: verify HDL export with iverilog simulation",
     )
     p.add_argument(
         "--model",
@@ -153,6 +154,34 @@ def main(argv: list[str] | None = None) -> None:
         res = estimate_resources(opt_graph)
         print(f"Estimated resources: LUTs={res['luts']} FFs={res['ffs']} "
               f"BRAMs={res['brams']} DSPs={res['dsps']}")
+
+    if args.mode == "simulate":
+        from kllm.circuit_graph import CircuitGraph, evaluate
+        from kllm.hdl_simulate import simulate
+
+        print("HDL simulation — building test circuit...")
+
+        # Build a small self-contained test graph (scalar ops)
+        g = CircuitGraph()
+        a = g.const(np.float32(1.5), name="a")
+        b = g.const(np.float32(2.0), name="b")
+        c = g.add(a, b, name="sum")       # 3.5
+        d = g.mul(a, b, name="product")   # 3.0
+        e = g.neg(c, name="neg_sum")      # -3.5
+        _f = g.sub(d, e, name="result")   # 3.0 - (-3.5) = 6.5
+
+        values = evaluate(g)
+        print(f"  Test graph: {len(g)} nodes, "
+              f"{sum(1 for n in g.nodes if n.op.value not in ('const','input'))} gates")
+
+        sim_dir = os.path.join(args.save_dir, "sim")
+        result = simulate(g, values, work_dir=sim_dir, verbose=True)
+
+        if result["passed"]:
+            print("\nSimulation PASSED")
+        else:
+            print("\nSimulation FAILED")
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":

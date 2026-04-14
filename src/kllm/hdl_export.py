@@ -372,21 +372,15 @@ def export_testbench(
 
     _L(f"        valid_in = 1;")
     _L(f"        #10;")
-    _L(f"        valid_in = 0;")
-    _L(f"")
 
-    # Check outputs
-    _L(f"        // Wait for valid_out")
-    _L(f"        @(posedge valid_out);")
-    _L(f"        #1;")
-
+    # Check outputs (combinational — results available after propagation)
     for node in outputs:
         if node.id in values:
             size = _tensor_bits(node, float_width)
             hex_val = _array_to_hex(values[node.id], float_width)
             _L(f"        // Check {node.name}")
             _L(f"        if (out_{node.id} !== {size}'h{hex_val})")
-            _L(f"            $error(\"MISMATCH: out_{node.id}\");")
+            _L(f"            $error(\"MISMATCH: out_{node.id} expected={size}'h{hex_val} got=%h\", out_{node.id});")
             _L(f"        else")
             _L(f"            $display(\"PASS: out_{node.id}\");")
 
@@ -705,12 +699,15 @@ def _emit_helper_modules(
         _L(f"module fp_{op} #(parameter W = 32) (")
         _L(f"    input  wire [W-1:0] a,")
         _L(f"    input  wire [W-1:0] b,")
-        _L(f"    output wire [W-1:0] y")
+        _L(f"    output reg  [W-1:0] y")
         _L(f");")
-        _L(f"    // Behavioral model (simulation only)")
-        _L(f"    real a_real, b_real, y_real;")
-        _L(f"    assign a_real = $bitstoreal({{32'b0, a}});")
-        _L(f"    assign y = $realtobits(a_real {op_sym.get(op, '+')} b_real)[31:0];")
+        _L(f"    shortreal a_f, b_f, y_f;")
+        _L(f"    always @* begin")
+        _L(f"        a_f = $bitstoshortreal(a);")
+        _L(f"        b_f = $bitstoshortreal(b);")
+        _L(f"        y_f = a_f {op_sym.get(op, '+')} b_f;")
+        _L(f"        y = $shortrealtobits(y_f);")
+        _L(f"    end")
         _L(f"endmodule")
 
     for fn in sorted(luts_used):

@@ -291,3 +291,43 @@ class TestRoundTrip:
         assert "abs" in source
         assert "lut_exp" in source
         assert "reduce_sum" in source
+
+
+# ---------------------------------------------------------------
+# Simulation
+# ---------------------------------------------------------------
+
+class TestSimulation:
+    def test_structural_verification(self, tmp_path):
+        """Structural verifier catches all constants and connectivity."""
+        from kllm.hdl_simulate import simulate
+
+        g = CircuitGraph()
+        a = g.const(np.float32(2.5), name="a")
+        b = g.const(np.float32(1.0), name="b")
+        g.add(a, b, name="c")
+
+        result = simulate(g, work_dir=str(tmp_path), verbose=False)
+        s = result["structural"]
+        assert s["consts_ok"] == s["consts_total"]
+        assert s["dangling_inputs"] == 0
+
+    def test_iverilog_simulation(self, tmp_path):
+        """Full iverilog simulation with golden value check."""
+        import shutil
+        from kllm.hdl_simulate import simulate
+
+        if not shutil.which("iverilog"):
+            pytest.skip("iverilog not installed")
+
+        g = CircuitGraph()
+        a = g.const(np.float32(3.0), name="a")
+        b = g.const(np.float32(4.0), name="b")
+        g.add(a, b, name="sum")   # 7.0
+
+        result = simulate(g, work_dir=str(tmp_path), verbose=False)
+        assert result["passed"]
+        iv = result["iverilog"]
+        assert iv["passed"]
+        assert iv["passes"] == 1
+        assert iv["mismatches"] == 0

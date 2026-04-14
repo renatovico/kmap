@@ -19,6 +19,12 @@ from kllm.hdl_export import (
 )
 
 
+def _read(path: str) -> str:
+    """Read a generated HDL file back for assertion checks."""
+    with open(path) as f:
+        return f.read()
+
+
 @pytest.fixture
 def simple_graph():
     """Graph: const → add → neg."""
@@ -56,56 +62,66 @@ def graph_with_input():
 class TestVerilogExport:
     def test_generates_file(self, simple_graph, tmp_path):
         path = str(tmp_path / "test.v")
-        source = export_verilog(simple_graph, path)
+        export_verilog(simple_graph, path)
+        source = _read(path)
         assert (tmp_path / "test.v").exists()
         assert len(source) > 0
 
     def test_contains_module(self, simple_graph, tmp_path):
         path = str(tmp_path / "test.v")
-        source = export_verilog(simple_graph, path, module_name="test_top")
+        export_verilog(simple_graph, path, module_name="test_top")
+        source = _read(path)
         assert "module test_top" in source
         assert "endmodule" in source
 
     def test_contains_constants(self, simple_graph, tmp_path):
         path = str(tmp_path / "test.v")
-        source = export_verilog(simple_graph, path)
+        export_verilog(simple_graph, path)
+        source = _read(path)
         assert "n_0" in source  # first const
         assert "n_1" in source  # second const
 
     def test_contains_add_node(self, simple_graph, tmp_path):
         path = str(tmp_path / "test.v")
-        source = export_verilog(simple_graph, path)
+        export_verilog(simple_graph, path)
+        source = _read(path)
         assert "fp_add" in source
 
     def test_contains_neg_as_xor(self, simple_graph, tmp_path):
         path = str(tmp_path / "test.v")
-        source = export_verilog(simple_graph, path)
+        export_verilog(simple_graph, path)
+        source = _read(path)
         assert "flip sign" in source or "80000000" in source
 
     def test_contains_lut_module(self, graph_with_lut, tmp_path):
         path = str(tmp_path / "test.v")
-        source = export_verilog(graph_with_lut, path)
+        export_verilog(graph_with_lut, path)
+        source = _read(path)
         assert "lut_silu" in source
 
     def test_contains_input_ports(self, graph_with_input, tmp_path):
         path = str(tmp_path / "test.v")
-        source = export_verilog(graph_with_input, path)
+        export_verilog(graph_with_input, path)
+        source = _read(path)
         assert "input" in source
         assert "in_0" in source  # input node port
 
     def test_contains_matmul(self, graph_with_input, tmp_path):
         path = str(tmp_path / "test.v")
-        source = export_verilog(graph_with_input, path)
+        export_verilog(graph_with_input, path)
+        source = _read(path)
         assert "fp_matmul" in source
 
     def test_pipeline_registers(self, simple_graph, tmp_path):
         path = str(tmp_path / "test.v")
-        source = export_verilog(simple_graph, path, pipeline_depth=2)
+        export_verilog(simple_graph, path, pipeline_depth=2)
+        source = _read(path)
         assert "Pipeline stage" in source
 
     def test_helper_modules_emitted(self, simple_graph, tmp_path):
         path = str(tmp_path / "test.v")
-        source = export_verilog(simple_graph, path)
+        export_verilog(simple_graph, path)
+        source = _read(path)
         # Should have fp_add behavioral module
         assert "module fp_add" in source
 
@@ -117,36 +133,42 @@ class TestVerilogExport:
 class TestVHDLExport:
     def test_generates_file(self, simple_graph, tmp_path):
         path = str(tmp_path / "test.vhd")
-        source = export_vhdl(simple_graph, path)
+        export_vhdl(simple_graph, path)
+        source = _read(path)
         assert (tmp_path / "test.vhd").exists()
         assert len(source) > 0
 
     def test_contains_entity(self, simple_graph, tmp_path):
         path = str(tmp_path / "test.vhd")
-        source = export_vhdl(simple_graph, path, entity_name="test_top")
+        export_vhdl(simple_graph, path, entity_name="test_top")
+        source = _read(path)
         assert "entity test_top" in source
         assert "end entity" in source
 
     def test_contains_architecture(self, simple_graph, tmp_path):
         path = str(tmp_path / "test.vhd")
-        source = export_vhdl(simple_graph, path)
+        export_vhdl(simple_graph, path)
+        source = _read(path)
         assert "architecture rtl" in source
         assert "begin" in source
 
     def test_contains_ieee_libs(self, simple_graph, tmp_path):
         path = str(tmp_path / "test.vhd")
-        source = export_vhdl(simple_graph, path)
+        export_vhdl(simple_graph, path)
+        source = _read(path)
         assert "library IEEE" in source
         assert "std_logic_1164" in source
 
     def test_contains_neg_as_xor(self, simple_graph, tmp_path):
         path = str(tmp_path / "test.vhd")
-        source = export_vhdl(simple_graph, path)
+        export_vhdl(simple_graph, path)
+        source = _read(path)
         assert "xor" in source or "80000000" in source
 
     def test_contains_lut_call(self, graph_with_lut, tmp_path):
         path = str(tmp_path / "test.vhd")
-        source = export_vhdl(graph_with_lut, path)
+        export_vhdl(graph_with_lut, path)
+        source = _read(path)
         assert "lut_silu" in source
 
 
@@ -258,7 +280,8 @@ class TestRoundTrip:
         j = g.sum(i, axis=-1)
 
         path = str(tmp_path / "all_ops.v")
-        source = export_verilog(g, path)
+        export_verilog(g, path)
+        source = _read(path)
 
         # Each op should have a corresponding node
         assert "fp_add" in source

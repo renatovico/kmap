@@ -36,6 +36,22 @@ import numpy as np
 from kllm.circuit_graph import CircuitGraph, Node, Op
 
 
+class _StreamWriter:
+    """Drop-in replacement for ``list`` that streams lines to a file.
+
+    Helper functions use ``_L = lines.append``; by passing a
+    _StreamWriter instead of a real list, every line goes straight
+    to disk — no 4 GB string in memory.
+    """
+
+    def __init__(self, f) -> None:
+        self._f = f
+
+    def append(self, line: str) -> None:          # noqa: D401
+        self._f.write(line)
+        self._f.write("\n")
+
+
 # ---------------------------------------------------------------
 # Verilog emitter
 # ---------------------------------------------------------------
@@ -65,9 +81,11 @@ def export_verilog(
     Returns
     -------
     str
-        The generated Verilog source code.
+        Output file path.
     """
-    lines: list[str] = []
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    _file = open(path, "w")
+    lines = _StreamWriter(_file)
     _L = lines.append
 
     # Analyse graph
@@ -156,12 +174,8 @@ def export_verilog(
     # Emit helper modules
     _emit_helper_modules(lines, graph, float_width)
 
-    source = "\n".join(lines)
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w") as f:
-        f.write(source)
-
-    return source
+    _file.close()
+    return path
 
 
 # ---------------------------------------------------------------
@@ -190,9 +204,11 @@ def export_vhdl(
     Returns
     -------
     str
-        The generated VHDL source code.
+        Output file path.
     """
-    lines: list[str] = []
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    _file = open(path, "w")
+    lines = _StreamWriter(_file)
     _L = lines.append
 
     inputs = [n for n in graph.nodes if n.op == Op.INPUT]
@@ -267,12 +283,8 @@ def export_vhdl(
     _L(f"")
     _L(f"end architecture rtl;")
 
-    source = "\n".join(lines)
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w") as f:
-        f.write(source)
-
-    return source
+    _file.close()
+    return path
 
 
 # ---------------------------------------------------------------
@@ -568,6 +580,14 @@ def _emit_node_verilog(
         _L(f"        .a(n_{node.inputs[0]}), .b(n_{node.inputs[1]}), .y(n_{node.id})")
         _L(f"    );")
 
+    elif node.op == Op.MATMUL_Q8:
+        size = _tensor_bits(node, float_width)
+        _L(f"    // matmul_q8: {node.name}")
+        _L(f"    wire [{size - 1}:0] n_{node.id};")
+        _L(f"    fp_matmul_q8 u_{node.id} (")
+        _L(f"        .x(n_{node.inputs[0]}), .w_q8(n_{node.inputs[1]}), .scales(n_{node.inputs[2]}), .y(n_{node.id})")
+        _L(f"    );")
+
     elif node.op in (Op.MAX, Op.CMP_LE, Op.MUX):
         size = _tensor_bits(node, float_width)
         _L(f"    // {node.op.value}: {node.name}")
@@ -629,6 +649,10 @@ def _emit_node_vhdl(
         _L(f"    -- matmul: {node.name}")
         _L(f"    n_{node.id} <= fp_matmul(n_{node.inputs[0]}, n_{node.inputs[1]});")
 
+    elif node.op == Op.MATMUL_Q8:
+        _L(f"    -- matmul_q8: {node.name}")
+        _L(f"    n_{node.id} <= fp_matmul_q8(n_{node.inputs[0]}, n_{node.inputs[1]}, n_{node.inputs[2]});")
+
     elif node.op in (Op.RESHAPE, Op.TRANSPOSE, Op.CONCAT, Op.REPEAT,
                      Op.SLICE, Op.EXPAND_DIMS, Op.CAST):
         _L(f"    -- {node.op.value}: {node.name} (wire routing)")
@@ -660,6 +684,19 @@ def _emit_helper_modules(
             ops_used.add(node.op.value)
         if node.op == Op.LUT:
             luts_used.add(node.params.get("fn", ""))
+
+    if "matmul_q8" in {node.op.value for node in graph.nodes}:
+        _L(f"")
+        _L(f"// Behavioral INT8 matmul — replace with vendor IP for synthesis")
+        _L(f"module fp_matmul_q8 (")
+        _L(f"    input  wire [31:0] x,")
+        _L(f"    input  wire [ 7:0] w_q8,")
+        _L(f"    input  wire [31:0] scales,")
+        _L(f"    output wire [31:0] y")
+        _L(f");")
+        _L(f"    // Behavioral: y = x * (float)w_q8 * scales")
+        _L(f"    assign y = 32'b0;  // placeholder — implement as DSP MAC chain")
+        _L(f"endmodule")
 
     for op in sorted(ops_used):
         op_sym = {"add": "+", "sub": "-", "mul": "*", "div": "/"}

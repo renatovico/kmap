@@ -122,28 +122,23 @@ def main(argv: list[str] | None = None) -> None:
         print_generate_report(stats)
 
     if args.mode == "export-hdl":
-        from kllm.circuit_compiler import compile_model
+        from kllm.circuit_compiler import compile_decode_template
         from kllm.circuit_graph import CircuitGraph
         from kllm.fabric import Fabric
         from kllm.graph_optimizer import optimize_graph
         from kllm.hdl_export import (
             export_verilog, export_vhdl, estimate_resources,
         )
-        from kllm.tokenizer import Tokenizer
 
         fabric = Fabric(args.save_dir)
-        tok_dir = os.path.join(args.save_dir, "tokenizer")
-        tokenizer = Tokenizer(tok_dir)
 
-        text = _get_text(args)
-        messages = [{"role": "user", "content": text}]
-        token_ids = tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True,
-        )
+        print("Compiling decode template to circuit graph (INPUT ports for prompt)...")
+        machine = compile_decode_template(fabric)
+        graph = machine.graph
+        opt_graph, id_map = optimize_graph(graph, [machine.logits_id])
 
-        print(f"Compiling {len(token_ids)} tokens to circuit graph...")
-        graph, logits_id, _kv = compile_model(fabric, token_ids)
-        opt_graph, id_map = optimize_graph(graph, [logits_id])
+        print(f"  Graph: {len(graph)} nodes → {len(opt_graph)} optimised")
+        print(f"  INPUT ports: {list(machine.input_ids.keys())}")
 
         hdl_dir = os.path.join(args.save_dir, "hdl")
         os.makedirs(hdl_dir, exist_ok=True)

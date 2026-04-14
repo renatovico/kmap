@@ -223,7 +223,9 @@ class TestHDLExportIntegration:
         graph, _, _kv = compiled
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "top.v")
-            content = export_verilog(graph, path)
+            export_verilog(graph, path)
+            with open(path) as f:
+                content = f.read()
             assert "module" in content
             assert os.path.isfile(path)
 
@@ -231,7 +233,9 @@ class TestHDLExportIntegration:
         graph, _, _kv = compiled
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "top.vhd")
-            content = export_vhdl(graph, path)
+            export_vhdl(graph, path)
+            with open(path) as f:
+                content = f.read()
             assert "entity" in content
             assert os.path.isfile(path)
 

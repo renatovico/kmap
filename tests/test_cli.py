@@ -28,17 +28,12 @@ class TestCLIHelp:
 
 class TestCLIParser:
     def test_max_tokens_flag(self):
-        r = _run_cli("--mode", "generate", "--max-tokens", "10", "--text", "hi",
+        r = _run_cli("--mode", "infer", "--max-tokens", "10", "--text", "hi",
                       "--save-dir", "/nonexistent", check=False)
         assert "unrecognized arguments" not in r.stderr
 
-    def test_solver_timeout_flag(self):
-        r = _run_cli("--mode", "compile", "--solver-timeout", "500",
-                      "--save-dir", "/nonexistent", check=False)
-        assert "unrecognized arguments" not in r.stderr
-
-    def test_max_layers_flag(self):
-        r = _run_cli("--mode", "compare", "--max-layers", "3", "--text", "hi",
+    def test_compare_mode_accepts_text(self):
+        r = _run_cli("--mode", "compare", "--text", "hi",
                       "--save-dir", "/nonexistent", check=False)
         assert "unrecognized arguments" not in r.stderr
 

@@ -1,169 +1,324 @@
-"""Z3 gate fabric loader.
+"""Model weight loader.
 
-Reads the compiled ``.npz`` files from disk, executes the Z3 gate
-pairs (shift + XOR) to recover float32 weights, and exposes them
-as plain NumPy arrays.
+Loads transformer weights as plain NumPy float32 arrays.  Two paths:
 
-This module is the *only* place that knows about the on-disk layout
-(``meta.npz``, ``globals.npz``, ``layer_<n>.npz``).
+1. ``Fabric.from_pretrained(model_name, save_dir)`` — download from
+   HuggingFace, extract weights, cache as ``.npy`` files.
+2. ``Fabric(save_dir)`` — load from previously cached ``.npy`` files.
+
+This module is the *only* place that knows about the on-disk weight
+layout (``config.json``, ``embed_tokens.npy``, ``layer_<n>/``).
 """
 
+import json
 import os
 import time
+from functools import lru_cache
 
 import numpy as np
-
-_NUM_PLANES = 4
-
-# Probe byte used to recover target: uint8(0xFF << s1) ^ mask == target.
-_Z3_PROBE = np.uint8(0xFF)
-
-
-def _z3_reconstruct_weight(
-    gates: tuple[tuple[np.ndarray, np.ndarray], ...],
-) -> np.ndarray:
-    """Fused Z3 gate execution + zero-copy float assembly.
-
-    Executes all four gate pairs and writes the recovered bytes directly
-    into a contiguous ``(…, 4)`` uint8 buffer, then reinterprets as
-    float32 via ``view`` — no shift/OR arithmetic for the repack step.
-
-    Pure bit operations: shift → XOR → view.
-    """
-    shape = gates[0][0].shape
-    buf = np.empty(shape + (4,), dtype=np.uint8)
-    for i, (s1, mask) in enumerate(gates):
-        buf[..., i] = (_Z3_PROBE << s1).astype(np.uint8) ^ mask
-    return buf.view(np.float32).reshape(shape)
-
 
 LINEAR_NAMES = (
     "q_proj", "k_proj", "v_proj", "o_proj",
     "gate_proj", "up_proj", "down_proj",
 )
 
+_ATTN_WEIGHTS = ("q_proj", "k_proj", "v_proj", "o_proj")
+_MLP_WEIGHTS = ("gate_proj", "up_proj", "down_proj")
+
 
 class Fabric:
-    """Compiled Z3 gate fabric — loads and reconstructs model weights.
+    """Model weight container — exposes config + float32 weight arrays.
 
-    On construction, executes every Z3 gate pair (shift + XOR) to
-    recover the original float32 weights.  Gate arrays are then
-    discarded, leaving only cached float32 tensors in RAM.
+    Attributes
+    ----------
+    num_layers, hidden_size, num_heads, num_kv_heads, intermediate_size,
+    vocab_size, rms_norm_eps, rope_theta, head_dim, num_groups
+        Model topology.
+    embed_tokens : ndarray (vocab_size, hidden_size)
+    lm_head : ndarray (vocab_size, hidden_size) — may be tied to embed_tokens
+    final_norm_weight : ndarray (hidden_size,)
+    layers : list[dict[str, ndarray]]
+        Per-layer weight arrays (q_proj, k_proj, … , layernorm weights).
     """
 
     def __init__(self, save_dir: str) -> None:
         self.save_dir = save_dir
 
-        # ---- Metadata ----
-        meta_path = os.path.join(save_dir, "meta.npz")
-        if not os.path.exists(meta_path):
+        weights_dir = os.path.join(save_dir, "weights")
+        config_path = os.path.join(weights_dir, "config.json")
+
+        # Support legacy meta.npz layout as fallback
+        if not os.path.exists(config_path):
+            legacy_meta = os.path.join(save_dir, "meta.npz")
+            legacy_cache = os.path.join(save_dir, "optimized")
+            if os.path.exists(legacy_meta) and os.path.isdir(legacy_cache):
+                self._load_legacy(save_dir)
+                return
             raise FileNotFoundError(
-                f"No compiled fabric found at {save_dir}. "
+                f"No compiled model found at {save_dir}. "
                 "Run `kllm --mode compile` first."
             )
-        meta = np.load(meta_path, allow_pickle=True)
-        self.num_layers: int = int(meta["num_layers"])
-        self.hidden_size: int = int(meta["hidden_size"])
-        self.num_heads: int = int(meta["num_attention_heads"])
-        self.num_kv_heads: int = int(meta["num_key_value_heads"])
-        self.intermediate_size: int = int(meta["intermediate_size"])
-        self.vocab_size: int = int(meta["vocab_size"])
-        self.rms_norm_eps: float = float(meta["rms_norm_eps"])
-        self.rope_theta: float = float(meta["rope_theta"])
+
+        t0 = time.perf_counter()
+
+        with open(config_path) as f:
+            cfg = json.load(f)
+
+        self.num_layers: int = cfg["num_layers"]
+        self.hidden_size: int = cfg["hidden_size"]
+        self.num_heads: int = cfg["num_attention_heads"]
+        self.num_kv_heads: int = cfg["num_key_value_heads"]
+        self.intermediate_size: int = cfg["intermediate_size"]
+        self.vocab_size: int = cfg["vocab_size"]
+        self.rms_norm_eps: float = cfg["rms_norm_eps"]
+        self.rope_theta: float = cfg["rope_theta"]
         self.head_dim: int = self.hidden_size // self.num_heads
         self.num_groups: int = self.num_heads // self.num_kv_heads
 
-        # ---- Load weights: optimized cache or Z3 gates ----
-        t0 = time.perf_counter()
-
-        cache_dir = os.path.join(save_dir, "optimized")
-        if os.path.isfile(os.path.join(cache_dir, "embed_tokens.npy")):
-            self._load_cached(cache_dir)
-            self._optimized = True
-        else:
-            self._load_z3_gates(save_dir)
-            self._optimized = False
-
+        self._load_cached(weights_dir)
         self.load_time: float = time.perf_counter() - t0
 
-    def _load_cached(self, cache_dir: str) -> None:
-        """Load pre-materialized float32 weights (mmap, near-instant)."""
-        # embed_tokens needs fancy indexing (token lookup) — load into RAM.
+    def _load_cached(self, weights_dir: str) -> None:
+        """Load float32 weights from .npy cache."""
         self.embed_tokens = np.load(
-            os.path.join(cache_dir, "embed_tokens.npy"),
+            os.path.join(weights_dir, "embed_tokens.npy"),
         )
         self.final_norm_weight = np.load(
-            os.path.join(cache_dir, "final_norm_weight.npy"),
+            os.path.join(weights_dir, "final_norm_weight.npy"),
         )
 
-        lm_head_tied = bool(
-            np.load(os.path.join(cache_dir, "lm_head_tied.npy")),
-        )
-        if lm_head_tied:
-            self.lm_head = self.embed_tokens
+        lm_head_path = os.path.join(weights_dir, "lm_head.npy")
+        if os.path.exists(lm_head_path):
+            self.lm_head = np.load(lm_head_path)
         else:
-            self.lm_head = np.load(
-                os.path.join(cache_dir, "lm_head.npy"), mmap_mode="r",
-            )
+            self.lm_head = self.embed_tokens  # tied
 
         self.layers = []
         for li in range(self.num_layers):
-            layer_dir = os.path.join(cache_dir, f"layer_{li}")
+            layer_dir = os.path.join(weights_dir, f"layer_{li}")
             layer: dict[str, np.ndarray] = {}
             for name in LINEAR_NAMES:
                 layer[name] = np.load(
-                    os.path.join(layer_dir, f"{name}.npy"), mmap_mode="r",
+                    os.path.join(layer_dir, f"{name}.npy"),
                 )
             layer["input_layernorm_weight"] = np.load(
                 os.path.join(layer_dir, "input_layernorm_weight.npy"),
-                mmap_mode="r",
             )
             layer["post_attention_layernorm_weight"] = np.load(
                 os.path.join(layer_dir, "post_attention_layernorm_weight.npy"),
-                mmap_mode="r",
             )
             self.layers.append(layer)
 
-    def _load_z3_gates(self, save_dir: str) -> None:
-        """Original Z3 gate reconstruction (shift + XOR → float32)."""
-        gdata = np.load(
-            os.path.join(save_dir, "globals.npz"), allow_pickle=True,
-        )
-        self.embed_tokens = _z3_reconstruct_weight(tuple(
-            (np.array(gdata[f"embed_tokens_m{i}_s1"]),
-             np.array(gdata[f"embed_tokens_m{i}_mask"]))
-            for i in range(_NUM_PLANES)
-        ))
-        self.final_norm_weight = np.array(
-            gdata["final_norm_weight"],
-        )
+    def _load_legacy(self, save_dir: str) -> None:
+        """Load from legacy meta.npz + optimized/ layout."""
+        meta = np.load(os.path.join(save_dir, "meta.npz"), allow_pickle=True)
+        self.num_layers = int(meta["num_layers"])
+        self.hidden_size = int(meta["hidden_size"])
+        self.num_heads = int(meta["num_attention_heads"])
+        self.num_kv_heads = int(meta["num_key_value_heads"])
+        self.intermediate_size = int(meta["intermediate_size"])
+        self.vocab_size = int(meta["vocab_size"])
+        self.rms_norm_eps = float(meta["rms_norm_eps"])
+        self.rope_theta = float(meta["rope_theta"])
+        self.head_dim = self.hidden_size // self.num_heads
+        self.num_groups = self.num_heads // self.num_kv_heads
 
-        if bool(gdata["lm_head_tied"]):
-            self.lm_head = self.embed_tokens
-        else:
-            self.lm_head = _z3_reconstruct_weight(tuple(
-                (np.array(gdata[f"lm_head_m{i}_s1"]),
-                 np.array(gdata[f"lm_head_m{i}_mask"]))
-                for i in range(_NUM_PLANES)
-            ))
-        del gdata
+        cache_dir = os.path.join(save_dir, "optimized")
+        t0 = time.perf_counter()
+        self._load_cached(cache_dir)
+        self.load_time = time.perf_counter() - t0
 
-        self.layers = []
-        for li in range(self.num_layers):
-            path = os.path.join(save_dir, f"layer_{li}.npz")
-            raw = np.load(path)
-            layer: dict[str, np.ndarray] = {}
-            for name in LINEAR_NAMES:
-                gates = tuple(
-                    (np.array(raw[f"{name}_m{i}_s1"]),
-                     np.array(raw[f"{name}_m{i}_mask"]))
-                    for i in range(_NUM_PLANES)
-                )
-                layer[name] = _z3_reconstruct_weight(gates)
-            layer["input_layernorm_weight"] = np.array(
-                raw["input_layernorm_weight"],
+    # ------------------------------------------------------------------
+    # Transposed-weight cache (shared across all compile calls)
+    # ------------------------------------------------------------------
+
+    @lru_cache(maxsize=None)
+    def get_transposed(self, layer_idx: int, proj: str) -> np.ndarray:
+        """Return ``layers[layer_idx][proj].T`` as contiguous float32.
+
+        Results are cached so that ``compile_model`` and
+        ``compile_decode_template`` share the same array objects,
+        avoiding duplicate multi-GB allocations.
+        """
+        return np.ascontiguousarray(
+            self.layers[layer_idx][proj].T, dtype=np.float32)
+
+    @lru_cache(maxsize=None)
+    def get_fused_qkv_t(self, layer_idx: int) -> np.ndarray:
+        """Return ``[Wq | Wk | Wv].T`` — fused QKV weight matrix.
+
+        Shape: (hidden_size, q_dim + kv_dim + kv_dim).
+        One matmul replaces three separate Q/K/V projections.
+        """
+        q_t = self.get_transposed(layer_idx, "q_proj")
+        k_t = self.get_transposed(layer_idx, "k_proj")
+        v_t = self.get_transposed(layer_idx, "v_proj")
+        return np.ascontiguousarray(
+            np.concatenate([q_t, k_t, v_t], axis=1))
+
+    @lru_cache(maxsize=None)
+    def get_fused_gate_up_t(self, layer_idx: int) -> np.ndarray:
+        """Return ``[Wgate | Wup].T`` — fused Gate+Up weight matrix.
+
+        Shape: (hidden_size, 2 * intermediate_size).
+        One matmul replaces two separate gate/up projections.
+        """
+        gate_t = self.get_transposed(layer_idx, "gate_proj")
+        up_t = self.get_transposed(layer_idx, "up_proj")
+        return np.ascontiguousarray(
+            np.concatenate([gate_t, up_t], axis=1))
+
+    # ------------------------------------------------------------------
+    # INT8 quantization cache
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _quantize_per_column(w_f32: np.ndarray
+                             ) -> tuple[np.ndarray, np.ndarray]:
+        """Per-output-channel absmax quantization to int8.
+
+        Returns (w_q8, scales) where ``w_f32 ≈ w_q8.astype(f32) * scales``.
+        """
+        amax = np.abs(w_f32).max(axis=0)
+        amax = np.where(amax == 0, 1.0, amax)  # avoid div-by-zero
+        scales = (amax / 127.0).astype(np.float32)
+        w_q8 = np.clip(np.round(w_f32 / scales), -128, 127).astype(np.int8)
+        return w_q8, scales
+
+    @lru_cache(maxsize=None)
+    def get_quantized(self, layer_idx: int, proj: str
+                      ) -> tuple[np.ndarray, np.ndarray]:
+        """Return ``(W_q8, scales)`` for a single projection (transposed).
+
+        W_q8 shape: (in_features, out_features) int8
+        scales shape: (out_features,) float32
+        """
+        w_t = self.get_transposed(layer_idx, proj)
+        return self._quantize_per_column(w_t)
+
+    @lru_cache(maxsize=None)
+    def get_quantized_fused_qkv(self, layer_idx: int
+                                ) -> tuple[np.ndarray, np.ndarray]:
+        """Return ``(W_q8, scales)`` for fused QKV (transposed)."""
+        w_t = self.get_fused_qkv_t(layer_idx)
+        return self._quantize_per_column(w_t)
+
+    @lru_cache(maxsize=None)
+    def get_quantized_fused_gate_up(self, layer_idx: int
+                                    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return ``(W_q8, scales)`` for fused GateUp (transposed)."""
+        w_t = self.get_fused_gate_up_t(layer_idx)
+        return self._quantize_per_column(w_t)
+
+    # ------------------------------------------------------------------
+    # Class method: download from HuggingFace and cache
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        model_name: str,
+        save_dir: str = "./lossless_logic",
+    ) -> "Fabric":
+        """Download a model from HuggingFace and extract float32 weights.
+
+        Requires ``torch`` and ``transformers`` (compile-time only).
+        After the first call, weights are cached as ``.npy`` files —
+        subsequent loads via ``Fabric(save_dir)`` need only numpy.
+
+        Parameters
+        ----------
+        model_name : str
+            HuggingFace model ID (e.g. ``TinyLlama/TinyLlama-1.1B-Chat-v1.0``).
+        save_dir : str
+            Directory to save extracted weights and tokenizer.
+        """
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        print(f"[*] Loading {model_name} …")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name, dtype=torch.float32,
+        )
+        config = model.config
+
+        # ---- Save tokenizer ----
+        tok = AutoTokenizer.from_pretrained(model_name)
+        tok_dir = os.path.join(save_dir, "tokenizer")
+        tok.save_pretrained(tok_dir)
+        print(f"  -> tokenizer saved to {tok_dir}")
+
+        # ---- Save config ----
+        weights_dir = os.path.join(save_dir, "weights")
+        os.makedirs(weights_dir, exist_ok=True)
+
+        cfg = {
+            "model_name": model_name,
+            "num_layers": len(model.model.layers),
+            "hidden_size": config.hidden_size,
+            "num_attention_heads": config.num_attention_heads,
+            "num_key_value_heads": config.num_key_value_heads,
+            "intermediate_size": config.intermediate_size,
+            "vocab_size": config.vocab_size,
+            "rms_norm_eps": float(config.rms_norm_eps),
+            "rope_theta": float(
+                getattr(config, "rope_theta", None)
+                or (config.rope_scaling or {}).get("rope_theta", 10000.0)
+            ),
+        }
+        with open(os.path.join(weights_dir, "config.json"), "w") as f:
+            json.dump(cfg, f, indent=2)
+
+        # ---- Save global weights ----
+        embed = model.get_input_embeddings().weight.detach().numpy()
+        np.save(os.path.join(weights_dir, "embed_tokens.npy"), embed)
+
+        norm_w = model.model.norm.weight.detach().numpy()
+        np.save(os.path.join(weights_dir, "final_norm_weight.npy"), norm_w)
+
+        lm_head_w = model.lm_head.weight.detach().numpy()
+        tied = np.array_equal(lm_head_w, embed)
+        if not tied:
+            np.save(os.path.join(weights_dir, "lm_head.npy"), lm_head_w)
+        print(f"  -> global weights saved (lm_head tied={tied})")
+
+        # ---- Save per-layer weights ----
+        for li, layer in enumerate(model.model.layers):
+            layer_dir = os.path.join(weights_dir, f"layer_{li}")
+            os.makedirs(layer_dir, exist_ok=True)
+
+            attn = layer.self_attn
+            for name in _ATTN_WEIGHTS:
+                proj = getattr(attn, name, None)
+                if proj is not None:
+                    np.save(
+                        os.path.join(layer_dir, f"{name}.npy"),
+                        proj.weight.detach().numpy(),
+                    )
+
+            mlp = layer.mlp
+            for name in _MLP_WEIGHTS:
+                proj = getattr(mlp, name, None)
+                if proj is not None:
+                    np.save(
+                        os.path.join(layer_dir, f"{name}.npy"),
+                        proj.weight.detach().numpy(),
+                    )
+
+            np.save(
+                os.path.join(layer_dir, "input_layernorm_weight.npy"),
+                layer.input_layernorm.weight.detach().numpy(),
             )
-            layer["post_attention_layernorm_weight"] = np.array(
-                raw["post_attention_layernorm_weight"],
+            np.save(
+                os.path.join(layer_dir, "post_attention_layernorm_weight.npy"),
+                layer.post_attention_layernorm.weight.detach().numpy(),
             )
-            self.layers.append(layer)
+
+            print(f"  -> layer {li + 1}/{len(model.model.layers)} saved")
+
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        print(f"[+] Weights cached in {weights_dir}/")
+        return cls(save_dir)

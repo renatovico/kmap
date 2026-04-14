@@ -20,14 +20,10 @@ dependencies = [
 compile = [
     "torch>=2.0",
     "transformers>=4.40",
-    "z3-solver>=4.12",
-    "tqdm>=4.60",
 ]
 dev = [
     "torch>=2.0",
     "transformers>=4.40",
-    "z3-solver>=4.12",
-    "tqdm>=4.60",
     "pytest>=8.0",
     "ruff>=0.9",
 ]

@@ -1,47 +1,16 @@
 """Circuit optimizer — Espresso-style boolean logic minimization.
 
-After Z3 compiles the gate LUTs, this optimizer minimizes each
-boolean function using the Quine-McCluskey algorithm (exact two-level
-minimization), producing compact sum-of-products (SOP) representations.
+Minimizes byte-level boolean functions using the Quine-McCluskey
+algorithm (exact two-level minimization), producing compact
+sum-of-products (SOP) representations.
 
 Each byte-level gate function (8 inputs → 8 outputs) is decomposed
 into 8 single-output boolean functions and independently minimized.
 The result is a set of product terms (AND-OR logic) per output bit —
 the same representation a Karnaugh map or Espresso produces.
-
-Architecture
-------------
-**Constant gates** (weight storage): The identity function (output = input)
-is trivially minimized to 8 product terms (1 per bit).  The optimizer
-builds a compact 256-entry LUT from these SOPs and stores it in
-``circuits_optimized.npz``.  The Fabric loads this at startup and uses
-it for weight reconstruction instead of the raw Z3 ``(shift, mask)``
-pairs.
-
-**Activation functions** (silu, exp, rsqrt): Each is a 32-bit→32-bit
-function where every output byte depends on all 4 input bytes.  QMC on
-32 variables (2^32 minterms) is intractable, so these cannot be directly
-minimized.  The Z3 solver *proved* the NumPy formulas bit-exact for all
-2^32 float32 patterns — so ``_np_silu``, ``_np_exp``, ``_np_rsqrt`` ARE
-the circuits' transfer functions running at SIMD speed.  The optimizer
-analyses byte-plane projections (1 byte varies, 3 fixed to 0) to report
-the boolean complexity of each slice.
-
-Pipeline::
-
-    compile → compile-circuits → optimize-circuits → inference
-                                  ^^^^^^^^^^^^^^^^
-                                  this module
-
-Usage::
-
-    kllm --mode optimize-circuits
 """
 
 from __future__ import annotations
-
-import os
-import time
 
 import numpy as np
 
@@ -288,15 +257,11 @@ class OptimizedCircuit:
 # ---------------------------------------------------------------
 
 class CircuitOptimizer:
-    """Optimize Z3 gate circuits using Quine-McCluskey minimization.
+    """Quine-McCluskey minimization for byte-level boolean functions.
 
     For each byte-level gate function, decomposes into 8 single-output
     boolean functions and minimizes each — analogous to Karnaugh maps
     for ≤4 variables or Espresso for larger functions.
-
-    The optimizer works on byte→byte truth tables extracted from the
-    Z3 gate LUTs.  For full-domain mmap planes (uint32→uint8), it
-    analyses byte-slice projections to show the boolean complexity.
     """
 
     def __init__(self, save_dir: str = "./lossless_logic") -> None:
@@ -332,212 +297,4 @@ class CircuitOptimizer:
 
         return circuit
 
-    # ---- High-level optimize pipeline ---------------------------
 
-    def optimize(self) -> dict:
-        """Run full optimisation on compiled circuits.
-
-        1. Constant gate (identity)
-        2. Per-op byte-plane projections (silu, exp, rsqrt)
-
-        Returns stats dict.
-        """
-        from kllm.circuits import ArithmeticUnit, _exp_fn, _rsqrt_fn, _silu_fn
-
-        circuit_path = os.path.join(self.save_dir, "circuits.npz")
-        if not os.path.exists(circuit_path):
-            raise FileNotFoundError(
-                f"No circuits at {circuit_path}. "
-                "Run `kllm --mode compile-circuits` first."
-            )
-
-        print("=" * 64)
-        print("  Circuit Optimizer — Quine-McCluskey / Espresso")
-        print("=" * 64)
-        t0_all = time.perf_counter()
-
-        stats: dict = {}
-        all_circuits: dict[str, list[OptimizedCircuit]] = {}
-
-        # ---- 1. Constant gate (identity: output = input) --------
-        print("\n[constant] Identity function (output = input)")
-        identity_tt = np.arange(256, dtype=np.uint8)
-        const_opt = self.optimize_byte_function(identity_tt, name="constant")
-        stats["constant"] = {
-            "total_terms": const_opt.total_terms,
-            "terms_per_bit": [len(s) for s in const_opt.bit_sops],
-        }
-        # Build the optimized LUT — used by Fabric at inference time
-        const_lut = const_opt.to_lut()
-        np.testing.assert_array_equal(
-            const_lut, identity_tt,
-            err_msg="Optimized constant gate LUT mismatch!",
-        )
-
-        # Materialise the full gate execution table: gate_lut[s1, mask]
-        # = uint8(0xFF << s1) ^ mask.  Replaces per-element shift+XOR
-        # at weight load time with a single indexed read.
-        gate_lut = np.empty((8, 256), dtype=np.uint8)
-        probe = np.uint8(0xFF)
-        for s in range(8):
-            shifted = np.uint8(probe << np.uint8(s))
-            for m in range(256):
-                gate_lut[s, m] = shifted ^ np.uint8(m)
-
-        # Verify: gate_lut matches direct computation for all (s1, mask)
-        for s in range(8):
-            for m in range(256):
-                expected = np.uint8((np.uint8(0xFF) << np.uint8(s))) ^ np.uint8(m)
-                assert gate_lut[s, m] == expected, (
-                    f"gate_lut[{s},{m}]={gate_lut[s,m]} != {expected}"
-                )
-
-        print(
-            f"  → {const_opt.total_terms} total product terms "
-            f"(vs 512 bytes LUT) ✓ verified"
-        )
-        print(f"  → gate_lut[8,256] materialised for Fabric")
-
-        # ---- 2. Activation byte-plane projections ---------------
-        for op_name, fn in [
-            ("silu", _silu_fn),
-            ("exp", _exp_fn),
-            ("rsqrt", _rsqrt_fn),
-        ]:
-            print(f"\n[{op_name}] Byte-plane projections "
-                  f"(fix 3 bytes = 0, vary 1)")
-            plane_circuits: list[OptimizedCircuit] = []
-            total_terms = 0
-
-            for plane_idx in range(4):
-                # Build truth table: vary byte `plane_idx`, fix rest to 0
-                inputs_u32 = np.zeros(256, dtype=np.uint32)
-                for i in range(256):
-                    inputs_u32[i] = np.uint32(i) << np.uint32(plane_idx * 8)
-
-                y_float = fn(inputs_u32.view(np.float32)).astype(np.float32)
-                y_bytes = y_float.view(np.uint8).reshape(-1, 4)
-                truth_table = y_bytes[:, plane_idx]
-
-                print(f"  plane {plane_idx} (byte{plane_idx}→byte{plane_idx}):")
-                opt = self.optimize_byte_function(truth_table, name=op_name)
-                plane_circuits.append(opt)
-                total_terms += opt.total_terms
-
-            all_circuits[op_name] = plane_circuits
-            stats[op_name] = {
-                "total_terms": total_terms,
-                "terms_per_plane": [c.total_terms for c in plane_circuits],
-            }
-            print(f"  → {total_terms} total product terms across 4 planes")
-
-        elapsed = time.perf_counter() - t0_all
-
-        # ---- Summary -------------------------------------------
-        print(f"\n{'=' * 64}")
-        print(f"  Optimization complete in {elapsed:.1f}s")
-        print(f"{'=' * 64}")
-        grand_total = sum(s["total_terms"] for s in stats.values())
-        for name, s in stats.items():
-            print(f"  {name:12s}: {s['total_terms']:5d} product terms")
-        print(f"  {'total':12s}: {grand_total:5d} product terms")
-        print(f"{'=' * 64}")
-
-        # ---- Save -----------------------------------------------
-        self._save(stats, const_opt, gate_lut, all_circuits)
-
-        # ---- Materialize float32 weights for fast loading -------
-        self._materialize_weights()
-
-        return stats
-
-    def _save(
-        self,
-        stats: dict,
-        const_opt: OptimizedCircuit,
-        gate_lut: np.ndarray,
-        op_circuits: dict[str, list[OptimizedCircuit]],
-    ) -> None:
-        """Persist optimized circuits to ``circuits_optimized.npz``.
-
-        The ``gate_lut`` (8×256 uint8) is loaded by
-        :class:`~kllm.fabric.Fabric` to replace per-element shift+XOR
-        with a single indexed read during weight reconstruction.
-        """
-        out_path = os.path.join(self.save_dir, "circuits_optimized.npz")
-
-        flat: dict[str, np.ndarray] = {}
-        flat["_stats"] = np.array(str(stats), dtype=object)
-        flat["gate_lut"] = gate_lut
-
-        # Constant gate SOPs
-        for bit_idx, terms in enumerate(const_opt.bit_sops):
-            if terms:
-                flat[f"const/bit{bit_idx}/values"] = np.array(
-                    [t[0] for t in terms], dtype=np.uint16,
-                )
-                flat[f"const/bit{bit_idx}/masks"] = np.array(
-                    [t[1] for t in terms], dtype=np.uint16,
-                )
-
-        # Activation SOPs
-        for op_name, circuits in op_circuits.items():
-            for p_idx, circuit in enumerate(circuits):
-                for bit_idx, terms in enumerate(circuit.bit_sops):
-                    if terms:
-                        prefix = f"{op_name}/p{p_idx}/bit{bit_idx}"
-                        flat[f"{prefix}/values"] = np.array(
-                            [t[0] for t in terms], dtype=np.uint16,
-                        )
-                        flat[f"{prefix}/masks"] = np.array(
-                            [t[1] for t in terms], dtype=np.uint16,
-                        )
-
-        np.savez_compressed(out_path, **flat)
-        print(f"\n[+] Optimized circuits saved to {out_path}")
-
-    def _materialize_weights(self) -> None:
-        """Pre-compute float32 weights and save as ``.npy`` for fast loading.
-
-        Runs the full Z3 gate reconstruction once and caches the
-        resulting float32 arrays to ``<save_dir>/optimized/``.
-        On subsequent loads, :class:`~kllm.fabric.Fabric` mmap's
-        these files directly — skipping all shift+XOR computation.
-        """
-        from kllm.fabric import Fabric, LINEAR_NAMES
-
-        cache_dir = os.path.join(self.save_dir, "optimized")
-        os.makedirs(cache_dir, exist_ok=True)
-
-        print("\n[*] Materializing float32 weights from Z3 gates …")
-        t0 = time.perf_counter()
-
-        fabric = Fabric(self.save_dir)
-
-        # ---- Global weights ----
-        np.save(os.path.join(cache_dir, "embed_tokens.npy"), fabric.embed_tokens)
-        np.save(os.path.join(cache_dir, "final_norm_weight.npy"), fabric.final_norm_weight)
-
-        lm_head_tied = fabric.lm_head is fabric.embed_tokens
-        np.save(os.path.join(cache_dir, "lm_head_tied.npy"), np.array(lm_head_tied))
-        if not lm_head_tied:
-            np.save(os.path.join(cache_dir, "lm_head.npy"), fabric.lm_head)
-
-        # ---- Per-layer weights ----
-        total_bytes = (
-            fabric.embed_tokens.nbytes
-            + fabric.final_norm_weight.nbytes
-            + fabric.lm_head.nbytes
-        )
-        for li, layer_w in enumerate(fabric.layers):
-            layer_dir = os.path.join(cache_dir, f"layer_{li}")
-            os.makedirs(layer_dir, exist_ok=True)
-            for name, arr in layer_w.items():
-                np.save(os.path.join(layer_dir, f"{name}.npy"), arr)
-                total_bytes += arr.nbytes
-
-        elapsed = time.perf_counter() - t0
-        print(
-            f"[+] Cached {total_bytes / 1e9:.2f} GB to {cache_dir} "
-            f"in {elapsed:.1f}s ({fabric.num_layers} layers)"
-        )

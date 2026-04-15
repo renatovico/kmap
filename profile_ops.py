@@ -4,7 +4,7 @@ import numpy as np
 from collections import defaultdict
 
 from kllm.fabric import Fabric
-from kllm.jit_optimizer import JitSession
+from kllm.processor import Processor, NativeRunner
 from kllm.tokenizer import Tokenizer
 from kllm.circuit_executor import ExecutionPlan, precompute_consts, _get_lib, _LUT_FN_MAP, _to_c_float
 from kllm.circuit_graph import Op
@@ -13,32 +13,27 @@ fabric = Fabric("./lossless_logic")
 tok = Tokenizer("./lossless_logic/tokenizer")
 prompt = tok.encode("<|user|>\nHello<|assistant|>\n")
 
-# Get to steady state
-session = JitSession(fabric)
-logits = session.prefill(prompt)
-for _ in range(5):
-    next_id = int(np.argmax(logits[-1]))
-    logits = session.decode_step(next_id)
+# Build processor and runner
+proc = Processor.build(fabric, tok.eos_token_id)
+runner = NativeRunner(proc)
 
-# Build inputs for next step
-m = session._machine
-f = session.fabric
-next_id = int(np.argmax(logits[-1]))
-token_embed = f.embed_tokens[next_id:next_id + 1].astype(np.float32)
-rope_cos = session._rope_cos[session.position:session.position + 1]
-rope_sin = session._rope_sin[session.position:session.position + 1]
-inputs = {
-    m.input_ids['token_embed']: token_embed,
-    m.input_ids['rope_cos']: rope_cos,
-    m.input_ids['rope_sin']: rope_sin,
-}
-for li in range(session.num_layers):
-    k_cache, v_cache = session.kv_cache[li]
-    inputs[m.input_ids[f'L{li}/cache_k']] = k_cache
-    inputs[m.input_ids[f'L{li}/cache_v']] = v_cache
+# Warm up: prefill + 5 decode steps to reach steady state
+output = runner._infer_python(prompt, max_tokens=5)
+
+# Build inputs for profiling one decode step
+p = proc
+position = len(prompt) + len(output)
+last_token = output[-1] if output else prompt[-1]
+kv_cache = []
+for _ in range(p.num_layers):
+    kv_cache.append((
+        np.zeros((p.num_kv_heads, position, p.head_dim), dtype=np.float32),
+        np.zeros((p.num_kv_heads, position, p.head_dim), dtype=np.float32),
+    ))
+inputs = runner._build_inputs(last_token, position, kv_cache)
 
 # Timed run through the instruction tape with per-op timing
-plan = session._plan
+plan = runner._plan
 v = plan._base_values.copy()
 for nid, arr in inputs.items():
     v[nid] = np.ascontiguousarray(arr)

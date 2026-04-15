@@ -1,7 +1,8 @@
 """Chip — user-facing compiled model artifact.
 
 A Chip is a self-contained directory containing everything needed to
-run inference: a compiled Processor (datapath + ROMs) and a Tokenizer.
+run inference.  The Processor IS the chip — it contains the datapath,
+all ROMs (embedding, RoPE, tokenizer vocabulary + merges), and config.
 
 The chip is the unit the user creates, loads, and invokes::
 
@@ -9,8 +10,13 @@ The chip is the unit the user creates, loads, and invokes::
     kllm infer ./mychip --max-tokens 50 Hello world
 
 Internally, a Chip wraps:
-- ``Processor`` — the compiled inference machine (datapath + tables)
-- ``Tokenizer`` — text ↔ token IDs
+- ``Processor`` — the complete device (datapath + ROMs + tokenizer ROMs)
+- ``Tokenizer`` — reference BPE implementation (for encoding prompts)
+
+The Processor's on-chip tokenizer ROMs handle detokenization directly
+(ROM lookup from token_id → bytes).  The reference Tokenizer is kept
+for encoding prompts and chat template rendering, but the core data
+lives in the Processor's ROMs.
 """
 
 from __future__ import annotations
@@ -26,7 +32,7 @@ from kllm.tokenizer import Tokenizer
 
 
 class Chip:
-    """A compiled chip model — ready for inference.
+    """A compiled chip — Processor + reference Tokenizer.
 
     Create with ``Chip.create()`` (downloads + compiles), or load an
     existing one with ``Chip.load()``.
@@ -52,8 +58,8 @@ class Chip:
         """Download a HuggingFace model and compile it into a chip.
 
         This is the all-in-one command: download weights, extract
-        tokenizer, compile the decode datapath, optimise it, and
-        serialize everything to ``chip_path``.
+        tokenizer, compile the decode datapath, compile tokenizer ROMs,
+        optimise, and serialize everything to ``chip_path``.
         """
         from kllm.fabric import Fabric
 
@@ -63,13 +69,15 @@ class Chip:
         print(f"[chip] Downloading {model_name} …")
         fabric = Fabric.from_pretrained(model_name, chip_path)
 
-        # 2. Load tokenizer to get eos_token_id
+        # 2. Load tokenizer
         tok_dir = os.path.join(chip_path, "tokenizer")
         tokenizer = Tokenizer(tok_dir)
 
-        # 3. Build the processor (compile + optimize)
+        # 3. Build the processor — datapath + all ROMs (including tokenizer)
         print("[chip] Building processor …")
-        processor = Processor.build(fabric, tokenizer.eos_token_id)
+        processor = Processor.build(
+            fabric, tokenizer.eos_token_id, tokenizer=tokenizer,
+        )
 
         # 4. Save processor artifacts
         print("[chip] Saving processor …")
@@ -104,7 +112,10 @@ class Chip:
             )
 
         processor = Processor.load(chip_path)
-        tokenizer = Tokenizer(os.path.join(chip_path, "tokenizer"))
+
+        # Load reference tokenizer for encoding (if present)
+        tok_dir = os.path.join(chip_path, "tokenizer")
+        tokenizer = Tokenizer(tok_dir) if os.path.isdir(tok_dir) else None
         return cls(path=chip_path, processor=processor, tokenizer=tokenizer)
 
     @staticmethod
@@ -113,17 +124,19 @@ class Chip:
         return os.path.exists(os.path.join(chip_path, "chip.json"))
 
     def _get_runner(self) -> NativeRunner:
-        """Lazy-init the native runner."""
+        """Lazy-init the native runner (the virtual device)."""
         if self._runner is None:
             self._runner = NativeRunner(self.processor)
         return self._runner
 
     def infer(self, prompt: str, max_tokens: int = 50) -> str:
-        """Run inference: prompt string in, generated text out.
+        """Run inference: text in → text out through the device.
 
         The full loop (tokenize → prefill → decode → detokenize) runs
         through the processor — the same operations a hardware FSM
         would perform.
+
+        Detokenization uses the on-chip ROMs when available.
         """
         messages = [{"role": "user", "content": prompt}]
         prompt_str = self.tokenizer.apply_chat_template(
@@ -134,6 +147,9 @@ class Chip:
         runner = self._get_runner()
         generated = runner.infer(token_ids, max_tokens)
 
+        # Decode using on-chip ROMs if available, else reference tokenizer
+        if self.processor.tokenizer_roms:
+            return runner.decode_tokens(generated, skip_special=True)
         return self.tokenizer.decode(generated, skip_special_tokens=True)
 
     def infer_streaming(self, prompt: str, max_tokens: int = 50):
@@ -146,4 +162,9 @@ class Chip:
 
         runner = self._get_runner()
         for tok_id in runner.infer_streaming(token_ids, max_tokens):
-            yield self.tokenizer.decode([tok_id], skip_special_tokens=True)
+            if self.processor.tokenizer_roms:
+                yield runner.decode_tokens([tok_id], skip_special=True)
+            else:
+                yield self.tokenizer.decode(
+                    [tok_id], skip_special_tokens=True,
+                )

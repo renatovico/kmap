@@ -148,3 +148,66 @@ class TestRealTokenizer:
         text = "Olá, como está?"
         decoded = self.tok.decode(self.tok.encode(text), skip_special_tokens=True)
         assert decoded == text
+
+
+# ---- ROM compilation tests ----
+
+class TestTokenizerROMs:
+    def test_compile_roms_returns_dict(self, mini_tok):
+        roms = mini_tok.compile_roms()
+        assert isinstance(roms, dict)
+        assert "id_to_bytes" in roms
+        assert "id_to_offsets" in roms
+        assert "merge_a" in roms
+        assert "merge_b" in roms
+        assert "merge_result" in roms
+        assert "special_ids" in roms
+        assert "vocab_size" in roms
+
+    def test_compile_roms_vocab_size(self, mini_tok):
+        roms = mini_tok.compile_roms()
+        vocab_size = int(roms["vocab_size"][0])
+        assert vocab_size > 0
+        assert roms["id_to_offsets"].shape == (vocab_size, 2)
+
+    def test_compile_roms_decode_roundtrip(self, mini_tok):
+        """Token from ROM decode should match token from Python decode."""
+        roms = mini_tok.compile_roms()
+        offsets = roms["id_to_offsets"]
+        raw_bytes = roms["id_to_bytes"]
+
+        # Check known tokens
+        for token_str, token_id in [("▁Hello", 4), ("▁world", 5)]:
+            offset, length = int(offsets[token_id, 0]), int(offsets[token_id, 1])
+            rom_str = bytes(raw_bytes[offset:offset + length]).decode("utf-8")
+            assert rom_str == token_str
+
+    def test_compile_roms_merges(self, mini_tok):
+        roms = mini_tok.compile_roms()
+        assert len(roms["merge_a"]) == len(roms["merge_b"])
+        assert len(roms["merge_a"]) == len(roms["merge_result"])
+        assert len(roms["merge_a"]) > 0
+
+    def test_compile_roms_special_ids(self, mini_tok):
+        roms = mini_tok.compile_roms()
+        special = set(roms["special_ids"].tolist())
+        assert mini_tok.bos_token_id in special
+        assert mini_tok.eos_token_id in special
+
+    def test_save_load_roms(self, mini_tok, tmp_path):
+        roms_dir = str(tmp_path / "roms")
+        mini_tok.save_roms(roms_dir)
+
+        loaded = Tokenizer.load_roms(roms_dir)
+        assert set(loaded.keys()) == set(mini_tok.compile_roms().keys())
+
+        for key in loaded:
+            np.testing.assert_array_equal(
+                loaded[key], mini_tok.compile_roms()[key],
+            )
+
+    def test_compile_roms_cached(self, mini_tok):
+        """Second call returns same object (cached)."""
+        roms1 = mini_tok.compile_roms()
+        roms2 = mini_tok.compile_roms()
+        assert roms1 is roms2

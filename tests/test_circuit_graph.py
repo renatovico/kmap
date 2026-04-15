@@ -8,7 +8,8 @@ produces the golden output that the C executor must match.
 import numpy as np
 import pytest
 
-from kllm.circuit_graph import CircuitGraph, Op, evaluate, register_lut
+from kllm.circuit_graph import CircuitGraph, Op
+from kllm.evaluator import evaluate, register_lut
 
 
 # ---------------------------------------------------------------

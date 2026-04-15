@@ -9,7 +9,7 @@ import pytest
 import os
 import tempfile
 
-from kllm.processor import Processor, NativeRunner
+from kllm.processor import Processor, NativeRunner, clear_prefix_cache
 from kllm.circuit_graph import CircuitGraph, Op
 
 
@@ -179,6 +179,24 @@ class TestNativeRunner:
         output2 = runner2.infer([0, 1, 2], max_tokens=5)
 
         assert output1 == output2
+
+    def test_c_infer_matches_python_fallback(self):
+        """C processor_infer() must produce same tokens as Python loop."""
+        fab = MockFabric(num_layers=1, hidden_size=16, num_heads=2,
+                         num_kv_heads=2, intermediate_size=32, vocab_size=64)
+        proc = Processor.build(fab, eos_token_id=2)
+
+        # Force Python path
+        py_runner = NativeRunner(proc)
+        py_runner._c_infer_available = False
+        py_output = py_runner._infer_python([0, 1, 2], max_tokens=5)
+
+        # Use default path (C if available)
+        c_runner = NativeRunner(proc)
+        c_output = c_runner.infer([0, 1, 2], max_tokens=5)
+
+        assert py_output == c_output, (
+            f"C inference {c_output} != Python inference {py_output}")
 
     def test_save_load_then_infer_matches(self):
         """Inference after save/load must match original."""

@@ -10,7 +10,8 @@ import pytest
 from functools import lru_cache
 
 from kllm.circuit_compiler import compile_model, _build_rope_const
-from kllm.circuit_graph import CircuitGraph, Op, evaluate
+from kllm.circuit_graph import CircuitGraph, Op
+from kllm.evaluator import evaluate
 
 
 # ---------------------------------------------------------------

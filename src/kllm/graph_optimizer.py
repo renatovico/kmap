@@ -30,7 +30,8 @@ from copy import deepcopy
 
 import numpy as np
 
-from kllm.circuit_graph import CircuitGraph, Node, Op, evaluate
+from kllm.circuit_graph import CircuitGraph, Node, Op
+from kllm.evaluator import evaluate
 
 
 # ---------------------------------------------------------------

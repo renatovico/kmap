@@ -647,6 +647,20 @@ def _setup_tape_lib(lib: ctypes.CDLL) -> None:
     lib.tape_slot_read_shape.restype = I
     lib.tape_slot_read_shape.argtypes = [VP, I, IP]
 
+    # processor_infer — complete inference loop in C
+    lib.processor_infer.restype = I
+    lib.processor_infer.argtypes = [
+        VP,                # ctx
+        FP, I, I,          # embed_table, vocab_size, hidden_dim
+        FP, FP, I,         # rope_cos, rope_sin, head_dim
+        I, I, I,           # token_embed_slot, rope_cos_slot, rope_sin_slot
+        IP, IP,            # kv_in_slots, kv_out_slots
+        I, I, I,           # logits_slot, n_layers, num_kv_heads
+        IP, I,             # prompt_tokens, prompt_len
+        I, I,              # max_new_tokens, eos_token_id
+        IP, IP,            # output_tokens, output_len
+    ]
+
 
 # C tape instruction tags (match _tape_runner.c enum)
 _CT_LUT_SILU  = 0

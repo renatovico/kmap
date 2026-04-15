@@ -1,25 +1,120 @@
-"""Pure-Python BPE tokenizer loaded from tokenizer.json.
+"""Tokenizer circuit — BPE tokenizer as on-chip ROM + FSM.
 
-No HuggingFace dependency — reads the standard tokenizers JSON format
-directly and implements encode/decode with Metaspace pre-tokenisation
-and byte-fallback decoding.
+The tokenizer is a circuit component, not a software module.  Its data
+(vocabulary, merge priorities) compiles into ROM arrays that can be:
+
+1. **Executed natively** by the C tape runner (lookup tables in RAM).
+2. **Synthesised** to BRAM/ROM blocks on FPGA.
+3. **Simulated** in HDL alongside the inference datapath.
+
+The BPE algorithm itself is a finite-state machine (FSM) that walks
+the merge-priority ROM — the same controller logic that drives the
+inference datapath also drives tokenization.
+
+Architecture
+------------
+- ``Tokenizer``  — loads from tokenizer.json, the reference implementation.
+- ``compile_tokenizer_roms()`` — compiles vocab + merges into NumPy arrays
+  (the ROM images for the chip).
+- On-chip ROMs:
+    * ``id_to_bytes`` + ``id_to_offsets`` : decode ROM (token_id → UTF-8 bytes)
+    * ``merge_table``  : encode ROM  ((tok_a, tok_b) → merged_tok_id, by rank)
+    * ``vocab_to_id``  : encode ROM  (piece hash → token_id)
 """
 
 import json
 import os
 import re
 
+import numpy as np
+
+
+# ------------------------------------------------------------------
+# ROM compilation — tokenizer data → chip ROM arrays
+# ------------------------------------------------------------------
+
+def compile_tokenizer_roms(
+    vocab: dict[str, int],
+    merges: dict[tuple[str, str], int],
+    special_token_ids: set[int],
+) -> dict[str, np.ndarray]:
+    """Compile tokenizer tables into ROM-ready NumPy arrays.
+
+    Returns a dict of arrays that can be saved as .npy files and
+    loaded onto the chip (or synthesised into BRAM).
+
+    ROMs produced
+    -------------
+    * ``id_to_bytes``   : uint8[total_bytes]  — concatenated UTF-8 for all tokens
+    * ``id_to_offsets``  : int32[vocab_size, 2] — (offset, length) per token
+    * ``merge_a``       : int32[num_merges]   — left token id per merge
+    * ``merge_b``       : int32[num_merges]   — right token id per merge
+    * ``merge_result``  : int32[num_merges]   — merged token id
+    * ``special_ids``   : int32[N]            — special token ids (bos, eos, …)
+    * ``vocab_size``    : int32 scalar
+    """
+    vocab_size = max(vocab.values()) + 1
+
+    # --- Decode ROM: token_id → UTF-8 bytes ---
+    all_bytes = bytearray()
+    offsets = np.zeros((vocab_size, 2), dtype=np.int32)
+    id_to_token = {v: k for k, v in vocab.items()}
+
+    for tid in range(vocab_size):
+        tok_str = id_to_token.get(tid, "")
+        tok_bytes = tok_str.encode("utf-8")
+        offsets[tid] = [len(all_bytes), len(tok_bytes)]
+        all_bytes.extend(tok_bytes)
+
+    id_to_bytes = np.frombuffer(bytes(all_bytes), dtype=np.uint8).copy()
+
+    # --- Encode ROM: merge table (sorted by priority) ---
+    num_merges = len(merges)
+    merge_a = np.zeros(num_merges, dtype=np.int32)
+    merge_b = np.zeros(num_merges, dtype=np.int32)
+    merge_result = np.zeros(num_merges, dtype=np.int32)
+
+    sorted_merges = sorted(merges.items(), key=lambda x: x[1])
+    for rank, ((piece_a, piece_b), _) in enumerate(sorted_merges):
+        a_id = vocab.get(piece_a, -1)
+        b_id = vocab.get(piece_b, -1)
+        merged_str = piece_a + piece_b
+        result_id = vocab.get(merged_str, -1)
+        merge_a[rank] = a_id
+        merge_b[rank] = b_id
+        merge_result[rank] = result_id
+
+    # --- Special token IDs ---
+    special_arr = np.array(sorted(special_token_ids), dtype=np.int32)
+
+    return {
+        "id_to_bytes": id_to_bytes,
+        "id_to_offsets": offsets,
+        "merge_a": merge_a,
+        "merge_b": merge_b,
+        "merge_result": merge_result,
+        "special_ids": special_arr,
+        "vocab_size": np.array([vocab_size], dtype=np.int32),
+    }
+
+
+# ------------------------------------------------------------------
+# Tokenizer class — reference + ROM-compilable
+# ------------------------------------------------------------------
 
 class Tokenizer:
-    """SentencePiece-style BPE tokenizer.
+    """SentencePiece-style BPE tokenizer — circuit-compatible.
 
-    Loads vocabulary and merge rules from a ``tokenizer.json`` file
-    (the format written by HuggingFace ``tokenizers``).  Supports:
+    Loads vocabulary and merge rules from a ``tokenizer.json`` file.
+    The same data can be compiled into ROM arrays via ``compile_roms()``
+    for on-chip execution (FPGA or native C runner).
 
+    Supports:
     - Metaspace pre-tokeniser (``▁`` replaces leading spaces)
     - Byte-fallback for unknown characters
     - BOS / EOS special tokens
     - Chat-template rendering (Jinja-free, TinyLlama format)
+    - ROM compilation for chip integration
     """
 
     def __init__(self, path: str) -> None:
@@ -76,6 +171,45 @@ class Tokenizer:
         if os.path.exists(tpl_path):
             with open(tpl_path, encoding="utf-8") as f:
                 self._chat_template = f.read()
+
+        # Compiled ROMs (built lazily or on demand)
+        self._roms: dict[str, np.ndarray] | None = None
+
+    # ------------------------------------------------------------------
+    # ROM compilation
+    # ------------------------------------------------------------------
+    def compile_roms(self) -> dict[str, np.ndarray]:
+        """Compile tokenizer data into ROM arrays for on-chip use.
+
+        The returned arrays can be saved alongside the processor
+        circuit and synthesised into BRAM for FPGA.
+        """
+        if self._roms is None:
+            special_ids = {
+                self._vocab[t] for t in self._special_tokens
+                if t in self._vocab
+            }
+            self._roms = compile_tokenizer_roms(
+                self._vocab, self._merges, special_ids,
+            )
+        return self._roms
+
+    def save_roms(self, directory: str) -> None:
+        """Save compiled ROM arrays to disk."""
+        roms = self.compile_roms()
+        os.makedirs(directory, exist_ok=True)
+        for name, arr in roms.items():
+            np.save(os.path.join(directory, f"{name}.npy"), arr)
+
+    @staticmethod
+    def load_roms(directory: str) -> dict[str, np.ndarray]:
+        """Load previously compiled ROM arrays."""
+        roms = {}
+        for fname in os.listdir(directory):
+            if fname.endswith(".npy"):
+                name = fname[:-4]
+                roms[name] = np.load(os.path.join(directory, fname))
+        return roms
 
     # ------------------------------------------------------------------
     # Pre-tokenisation (Metaspace)

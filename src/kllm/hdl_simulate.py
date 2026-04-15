@@ -21,7 +21,8 @@ import tempfile
 
 import numpy as np
 
-from kllm.circuit_graph import CircuitGraph, Op, evaluate
+from kllm.circuit_graph import CircuitGraph, Op
+from kllm.evaluator import evaluate
 from kllm.hdl_export import (
     export_verilog,
     export_testbench,

@@ -7,7 +7,8 @@ for every op type and for full compiled transformer graphs.
 import numpy as np
 import pytest
 
-from kllm.circuit_graph import CircuitGraph, Op, evaluate
+from kllm.circuit_graph import CircuitGraph, Op
+from kllm.evaluator import evaluate
 from kllm.circuit_executor import evaluate_c
 
 

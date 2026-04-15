@@ -435,7 +435,7 @@ void tape_ctx_destroy(TapeCtx *ctx) {
 void tape_dequant_q8_weights(TapeCtx *ctx) {
     for (int i = 0; i < ctx->n_instrs; i++) {
         TapeInstr *op = &ctx->tape[i];
-        if (op->op != T_MATMUL_Q8 || !op->wq8_ptr || op->wf32_ptr)
+        if (op->tag != T_MATMUL_Q8 || !op->wq8_ptr || op->wf32_ptr)
             continue;
         int K = op->K_q8, N = op->N_q8;
         float *buf = (float *)malloc(K * N * sizeof(float));
@@ -851,4 +851,183 @@ void tape_run(TapeCtx *ctx) {
             break;
         }
     }
+}
+
+
+/* ================================================================
+ * processor_infer() — Complete inference loop in C.
+ *
+ * Runs prefill (one token at a time) then autoregressive decode.
+ * Same FSM as the Verilog inference_controller:
+ *   PREFILL: for each prompt token → embed → set rope → tape_run → accumulate KV
+ *   DECODE:  argmax → eos check → embed → set rope → tape_run → accumulate KV → loop
+ *
+ * Returns number of generated tokens in *output_len.
+ * ================================================================ */
+
+int processor_infer(
+    TapeCtx *ctx,
+    /* Processor resources (ROMs baked into the chip) */
+    const float *embed_table,   /* (vocab_size, hidden_dim) row-major */
+    int vocab_size,
+    int hidden_dim,
+    const float *rope_cos,      /* (max_seq, head_dim) row-major */
+    const float *rope_sin,      /* (max_seq, head_dim) row-major */
+    int head_dim,
+    /* Datapath slot mappings */
+    int token_embed_slot,
+    int rope_cos_slot,
+    int rope_sin_slot,
+    const int *kv_in_slots,     /* [n_layers * 2]: K_in, V_in, K_in, V_in, ... */
+    const int *kv_out_slots,    /* [n_layers * 2]: K_out, V_out, K_out, V_out, ... */
+    int logits_slot,
+    int n_layers,
+    int num_kv_heads,
+    /* Inference parameters */
+    const int *prompt_tokens,
+    int prompt_len,
+    int max_new_tokens,
+    int eos_token_id,
+    /* Output buffer (caller-allocated, size >= max_new_tokens) */
+    int *output_tokens,
+    int *output_len
+)
+{
+    /* KV cache buffers per layer: (num_kv_heads, seq_so_far, head_dim) */
+    int kv_dim = num_kv_heads * head_dim;
+    float **kv_k_buf = (float **)calloc(n_layers, sizeof(float *));
+    float **kv_v_buf = (float **)calloc(n_layers, sizeof(float *));
+    int *kv_seq_len = (int *)calloc(n_layers, sizeof(int));
+    int *kv_cap = (int *)calloc(n_layers, sizeof(int));
+
+    /* Temporary buffer for embedding (1, hidden_dim) */
+    float *embed_buf = (float *)malloc(hidden_dim * sizeof(float));
+    /* Temporary buffers for RoPE (1, head_dim) */
+    float *cos_buf = (float *)malloc(head_dim * sizeof(float));
+    float *sin_buf = (float *)malloc(head_dim * sizeof(float));
+
+    int embed_shape[2] = {1, hidden_dim};
+    int rope_shape[2] = {1, head_dim};
+
+    int position = 0;
+    int generated = 0;
+
+    /* ------ Helper: feed one token through the datapath ------ */
+    #define FEED_TOKEN(token_id, pos) do { \
+        /* Embed lookup */ \
+        memcpy(embed_buf, embed_table + (token_id) * hidden_dim, \
+               hidden_dim * sizeof(float)); \
+        tape_slot_write(ctx, token_embed_slot, embed_buf, hidden_dim); \
+        tape_slot_set_shape(ctx, token_embed_slot, embed_shape, 2); \
+        /* RoPE for this position */ \
+        memcpy(cos_buf, rope_cos + (pos) * head_dim, \
+               head_dim * sizeof(float)); \
+        memcpy(sin_buf, rope_sin + (pos) * head_dim, \
+               head_dim * sizeof(float)); \
+        tape_slot_write(ctx, rope_cos_slot, cos_buf, head_dim); \
+        tape_slot_set_shape(ctx, rope_cos_slot, rope_shape, 2); \
+        tape_slot_write(ctx, rope_sin_slot, sin_buf, head_dim); \
+        tape_slot_set_shape(ctx, rope_sin_slot, rope_shape, 2); \
+        /* Feed KV cache for each layer */ \
+        for (int li = 0; li < n_layers; li++) { \
+            int k_in = kv_in_slots[li * 2]; \
+            int v_in = kv_in_slots[li * 2 + 1]; \
+            int seq = kv_seq_len[li]; \
+            int sz = num_kv_heads * seq * head_dim; \
+            if (sz > 0) { \
+                tape_slot_write(ctx, k_in, kv_k_buf[li], sz); \
+                int kv_shape[3] = {num_kv_heads, seq, head_dim}; \
+                tape_slot_set_shape(ctx, k_in, kv_shape, 3); \
+                tape_slot_write(ctx, v_in, kv_v_buf[li], sz); \
+                tape_slot_set_shape(ctx, v_in, kv_shape, 3); \
+            } else { \
+                /* Empty cache: write a tiny placeholder */ \
+                float zero = 0.0f; \
+                int kv_shape[3] = {num_kv_heads, 0, head_dim}; \
+                tape_slot_write(ctx, k_in, &zero, 0); \
+                tape_slot_set_shape(ctx, k_in, kv_shape, 3); \
+                tape_slot_write(ctx, v_in, &zero, 0); \
+                tape_slot_set_shape(ctx, v_in, kv_shape, 3); \
+            } \
+        } \
+        /* Run datapath */ \
+        tape_run(ctx); \
+        /* Extract new KV and append to cache */ \
+        for (int li = 0; li < n_layers; li++) { \
+            int k_out = kv_out_slots[li * 2]; \
+            int v_out = kv_out_slots[li * 2 + 1]; \
+            int out_sz = 0; \
+            const float *new_k = tape_slot_read(ctx, k_out, &out_sz); \
+            /* out_sz = num_kv_heads * (seq+1) * head_dim (concat result) */ \
+            int new_seq = kv_seq_len[li] + 1; \
+            int new_total = num_kv_heads * new_seq * head_dim; \
+            /* Grow buffer if needed */ \
+            if (new_total > kv_cap[li]) { \
+                int cap = new_total * 2; /* double to amortize */ \
+                kv_k_buf[li] = (float *)realloc(kv_k_buf[li], \
+                    cap * sizeof(float)); \
+                kv_v_buf[li] = (float *)realloc(kv_v_buf[li], \
+                    cap * sizeof(float)); \
+                kv_cap[li] = cap; \
+            } \
+            memcpy(kv_k_buf[li], new_k, new_total * sizeof(float)); \
+            const float *new_v = tape_slot_read(ctx, v_out, &out_sz); \
+            memcpy(kv_v_buf[li], new_v, new_total * sizeof(float)); \
+            kv_seq_len[li] = new_seq; \
+        } \
+    } while(0)
+
+    /* ------ PREFILL: process each prompt token ------ */
+    for (int i = 0; i < prompt_len; i++) {
+        FEED_TOKEN(prompt_tokens[i], position);
+        position++;
+    }
+
+    /* ------ DECODE: autoregressive generation ------ */
+    for (int step = 0; step < max_new_tokens; step++) {
+        /* Argmax over logits[-1] (last row, vocab_size elements) */
+        int logits_sz = 0;
+        const float *logits = tape_slot_read(ctx, logits_slot, &logits_sz);
+        /* logits shape is (1, vocab_size) — last row is at end */
+        int last_row_start = logits_sz - vocab_size;
+        if (last_row_start < 0) last_row_start = 0;
+        float best_val = logits[last_row_start];
+        int best_id = 0;
+        for (int v = 1; v < vocab_size; v++) {
+            float val = logits[last_row_start + v];
+            if (val > best_val) {
+                best_val = val;
+                best_id = v;
+            }
+        }
+
+        /* EOS check */
+        if (best_id == eos_token_id) break;
+
+        output_tokens[step] = best_id;
+        generated++;
+
+        /* Feed new token */
+        FEED_TOKEN(best_id, position);
+        position++;
+    }
+
+    #undef FEED_TOKEN
+
+    *output_len = generated;
+
+    /* Cleanup */
+    for (int li = 0; li < n_layers; li++) {
+        free(kv_k_buf[li]);
+        free(kv_v_buf[li]);
+    }
+    free(kv_k_buf);
+    free(kv_v_buf);
+    free(kv_seq_len);
+    free(kv_cap);
+    free(embed_buf);
+    free(cos_buf);
+    free(sin_buf);
+
+    return 0; /* success */
 }

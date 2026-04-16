@@ -4,11 +4,11 @@ import time
 import numpy as np
 from collections import defaultdict
 
-from kllm.fabric import Fabric
-from kllm.processor import Processor
-from kllm.native_runner import NativeRunner
-from kllm.circuit_executor import ExecutionPlan, precompute_consts, _get_lib, _LUT_FN_MAP, _to_c_float
-from kllm.circuit_graph import Op
+from kllm.compiler.fabric import Fabric
+from kllm.device.processor import Processor
+from kllm.device.native_runner import NativeRunner
+from kllm.graph.circuit_executor import ExecutionPlan, precompute_consts, _get_lib, _LUT_FN_MAP, _to_c_float
+from kllm.graph.circuit_graph import Op
 
 fabric = Fabric("./lossless_logic")
 
@@ -54,7 +54,7 @@ for nid, arr in inputs.items():
 op_times = defaultdict(float)
 op_counts = defaultdict(int)
 
-import kllm.circuit_executor as ce
+import kllm.graph.circuit_executor as ce
 
 TAG_NAMES = {
     ce._T_LUT: 'LUT', ce._T_BINOP: 'BINOP', ce._T_CMP_LE: 'CMP_LE',

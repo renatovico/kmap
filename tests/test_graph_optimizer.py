@@ -7,9 +7,9 @@ while reducing node count.
 import numpy as np
 import pytest
 
-from kllm.circuit_graph import CircuitGraph, Op
-from kllm.evaluator import evaluate
-from kllm.graph_optimizer import (
+from kllm.graph.circuit_graph import CircuitGraph, Op
+from kllm.graph.evaluator import evaluate
+from kllm.graph.graph_optimizer import (
     constant_fold,
     dead_node_elimination,
     identity_elimination,
@@ -310,7 +310,7 @@ class TestOptimizeGraph:
 
     def test_compiled_model_folds_completely(self):
         """A compiled model (all constants) folds to one output node."""
-        from kllm.circuit_compiler import compile_model
+        from kllm.compiler.circuit_compiler import compile_model
         from tests.test_circuit_compiler import MockFabric
 
         fabric = MockFabric(num_layers=1, hidden_size=8, num_heads=2,

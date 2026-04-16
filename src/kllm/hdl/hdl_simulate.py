@@ -8,7 +8,7 @@ Supports two simulation backends:
 
 Usage::
 
-    from kllm.hdl_simulate import simulate
+    from kllm.hdl.hdl_simulate import simulate
     result = simulate(graph, values, work_dir="./sim_out")
 """
 
@@ -21,9 +21,9 @@ import tempfile
 
 import numpy as np
 
-from kllm.circuit_graph import CircuitGraph, Op
-from kllm.evaluator import evaluate
-from kllm.hdl_export import (
+from kllm.graph.circuit_graph import CircuitGraph, Op
+from kllm.graph.evaluator import evaluate
+from kllm.hdl.hdl_export import (
     export_verilog,
     export_testbench,
     _find_output_nodes,

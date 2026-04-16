@@ -442,7 +442,7 @@ class CircuitGraph:
 
     def evaluate(self, inputs: dict[int, np.ndarray] | None = None):
         """Evaluate using the reference evaluator (see evaluator.py)."""
-        from kllm.evaluator import evaluate as _evaluate
+        from kllm.graph.evaluator import evaluate as _evaluate
         return _evaluate(self, inputs)
 
     # ---- Serialization ------------------------------------------

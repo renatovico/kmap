@@ -162,19 +162,23 @@ kllm simulate-infer ./mychip --max-tokens 5 "Hello"
 ```
 src/kllm/
 ├── cli.py                # CLI entry point (create, infer, compare, export-hdl, simulate-infer)
-├── chip.py               # Chip: self-contained compiled model artifact (bytes in → bytes out)
-├── processor.py          # Processor: datapath + tokenizer + config (the virtual device)
-├── native_runner.py      # NativeRunner: C virtual processor emulation (ctypes bridge)
-├── fabric.py             # Model weight loader (HuggingFace → float32 arrays)
-├── circuit_graph.py      # Core DAG: circuit builder + reference NumPy evaluator
-├── circuit_compiler.py   # Compile transformer into CircuitGraph
-├── circuit_executor.py   # C-accelerated graph evaluator + CTapeRunner (ctypes wrapper)
-├── circuit_tokenizer.py  # Compile BPE tokenizer into circuit graph ROMs
-├── graph_optimizer.py    # Constant folding + dead elimination + identity elimination
-├── hdl_export.py         # Verilog / VHDL export + resource estimation
-├── hdl_simulate.py       # Verilog simulation (iverilog + vvp)
 ├── compare.py            # HuggingFace vs kllm side-by-side comparison
-└── evaluator.py          # High-level evaluation helpers
+├── graph/                # Core DAG, evaluation, optimization, execution
+│   ├── circuit_graph.py  #   Circuit builder + reference NumPy evaluator
+│   ├── evaluator.py      #   Reference NumPy evaluator (golden model)
+│   ├── graph_optimizer.py#   Constant folding + dead elimination + identity elimination
+│   └── circuit_executor.py#  C-accelerated evaluator + CTapeRunner (ctypes wrapper)
+├── compiler/             # Model-to-circuit compilation
+│   ├── fabric.py         #   Model weight loader (HuggingFace → float32 arrays)
+│   ├── circuit_compiler.py#  Compile transformer into CircuitGraph
+│   └── circuit_tokenizer.py# Compile BPE tokenizer into circuit graph ROMs
+├── device/               # Assembled chip and runtime
+│   ├── chip.py           #   Chip: compiled model artifact (bytes in → bytes out)
+│   ├── processor.py      #   Processor: datapath + tokenizer + config (the virtual device)
+│   └── native_runner.py  #   NativeRunner: C virtual processor emulation (ctypes bridge)
+└── hdl/                  # Hardware synthesis and simulation
+    ├── hdl_export.py     #   Verilog / VHDL export + resource estimation
+    └── hdl_simulate.py   #   Verilog simulation (iverilog + vvp)
 
 csrc/
 ├── _tape_runner.c        # C virtual processor: tape engine + BPE encode/decode + full inference loop

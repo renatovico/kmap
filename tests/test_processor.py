@@ -9,9 +9,9 @@ import pytest
 import os
 import tempfile
 
-from kllm.processor import Processor
-from kllm.native_runner import NativeRunner
-from kllm.circuit_graph import CircuitGraph, Op
+from kllm.device.processor import Processor
+from kllm.device.native_runner import NativeRunner
+from kllm.graph.circuit_graph import CircuitGraph, Op
 
 
 # ---------------------------------------------------------------

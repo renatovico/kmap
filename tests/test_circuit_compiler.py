@@ -9,9 +9,9 @@ import numpy as np
 import pytest
 from functools import lru_cache
 
-from kllm.circuit_compiler import compile_model, _build_rope_const
-from kllm.circuit_graph import CircuitGraph, Op
-from kllm.evaluator import evaluate
+from kllm.compiler.circuit_compiler import compile_model, _build_rope_const
+from kllm.graph.circuit_graph import CircuitGraph, Op
+from kllm.graph.evaluator import evaluate
 
 
 # ---------------------------------------------------------------

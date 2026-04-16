@@ -32,7 +32,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from kllm.circuit_graph import CircuitGraph
+from kllm.graph.circuit_graph import CircuitGraph
 
 
 # ------------------------------------------------------------------

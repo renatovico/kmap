@@ -10,9 +10,9 @@ Verifies that:
 import numpy as np
 import pytest
 
-from kllm.circuit_graph import CircuitGraph, Op
-from kllm.evaluator import evaluate
-from kllm.hdl_export import (
+from kllm.graph.circuit_graph import CircuitGraph, Op
+from kllm.graph.evaluator import evaluate
+from kllm.hdl.hdl_export import (
     export_verilog,
     export_vhdl,
     export_testbench,
@@ -250,7 +250,7 @@ class TestResourceEstimation:
 
     def test_compiled_model_estimation(self):
         """Resource estimate for a compiled model."""
-        from kllm.circuit_compiler import compile_model
+        from kllm.compiler.circuit_compiler import compile_model
         from tests.test_circuit_compiler import MockFabric
 
         fabric = MockFabric(num_layers=1, hidden_size=8, num_heads=2,
@@ -301,7 +301,7 @@ class TestRoundTrip:
 class TestSimulation:
     def test_structural_verification(self, tmp_path):
         """Structural verifier catches all constants and connectivity."""
-        from kllm.hdl_simulate import simulate
+        from kllm.hdl.hdl_simulate import simulate
 
         g = CircuitGraph()
         a = g.const(np.float32(2.5), name="a")
@@ -316,7 +316,7 @@ class TestSimulation:
     def test_iverilog_simulation(self, tmp_path):
         """Full iverilog simulation with golden value check."""
         import shutil
-        from kllm.hdl_simulate import simulate
+        from kllm.hdl.hdl_simulate import simulate
 
         if not shutil.which("iverilog"):
             pytest.skip("iverilog not installed")

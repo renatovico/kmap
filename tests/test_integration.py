@@ -11,12 +11,12 @@ from functools import lru_cache
 import numpy as np
 import pytest
 
-from kllm.circuit_compiler import compile_model
-from kllm.circuit_graph import CircuitGraph, Op
-from kllm.evaluator import evaluate
-from kllm.circuit_executor import evaluate_c
-from kllm.graph_optimizer import optimize_graph, optimization_stats
-from kllm.hdl_export import export_verilog, export_vhdl, export_testbench, estimate_resources
+from kllm.compiler.circuit_compiler import compile_model
+from kllm.graph.circuit_graph import CircuitGraph, Op
+from kllm.graph.evaluator import evaluate
+from kllm.graph.circuit_executor import evaluate_c
+from kllm.graph.graph_optimizer import optimize_graph, optimization_stats
+from kllm.hdl.hdl_export import export_verilog, export_vhdl, export_testbench, estimate_resources
 
 
 # ---------------------------------------------------------------------------

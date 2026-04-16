@@ -18,21 +18,21 @@ import tempfile
 import numpy as np
 import pytest
 
-from kllm.circuit_graph import CircuitGraph, Op
-from kllm.circuit_tokenizer import (
+from kllm.graph.circuit_graph import CircuitGraph, Op
+from kllm.compiler.circuit_tokenizer import (
     compile_tokenizer_roms,
     compile_tokenizer_graph,
     compile_tokenizer_graph_from_json,
     TokenizerGraphMaps,
     _fnv1a,
 )
-from kllm.evaluator import (
+from kllm.graph.evaluator import (
     evaluate,
     _vocab_hash_lookup,
     _ref_bpe_encode,
     _ref_bpe_decode,
 )
-from kllm.circuit_executor import evaluate_c
+from kllm.graph.circuit_executor import evaluate_c
 
 
 # ------------------------------------------------------------------

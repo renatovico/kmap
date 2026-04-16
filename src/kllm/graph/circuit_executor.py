@@ -6,7 +6,7 @@ the compiled C shared library ``_circuit_eval.so``.
 
 Usage::
 
-    from kllm.circuit_executor import evaluate_c
+    from kllm.graph.circuit_executor import evaluate_c
     values = evaluate_c(graph, inputs)
     # values is identical to circuit_graph.evaluate(graph, inputs)
 """
@@ -22,7 +22,7 @@ from pathlib import Path
 
 import numpy as np
 
-from kllm.circuit_graph import CircuitGraph, Op
+from kllm.graph.circuit_graph import CircuitGraph, Op
 
 # Module-level ctypes pointer types (avoid repeated POINTER() calls)
 _FP = ctypes.POINTER(ctypes.c_float)
@@ -33,7 +33,7 @@ _I8P = ctypes.POINTER(ctypes.c_int8)
 # ---------------------------------------------------------------
 
 _LIB: ctypes.CDLL | None = None
-_CSRC_DIR = Path(__file__).resolve().parent.parent.parent / "csrc"
+_CSRC_DIR = Path(__file__).resolve().parent.parent.parent.parent / "csrc"
 
 
 def _lib_path() -> Path:
@@ -565,7 +565,7 @@ class ExecutionPlan:
 
             elif tag in (_T_BPE_ENCODE, _T_BPE_DECODE):
                 # (tag, nid, input_nids_tuple, node)
-                from kllm.evaluator import _eval_bpe_encode, _eval_bpe_decode
+                from kllm.graph.evaluator import _eval_bpe_encode, _eval_bpe_decode
                 inp_vals = [v[i] for i in instr[2]]
                 node = instr[3]
                 if tag == _T_BPE_ENCODE:
@@ -607,7 +607,7 @@ def _get_tape_lib() -> ctypes.CDLL:
     if _TAPE_LIB is not None:
         return _TAPE_LIB
 
-    csrc_dir = Path(__file__).resolve().parent.parent.parent / "csrc"
+    csrc_dir = Path(__file__).resolve().parent.parent.parent.parent / "csrc"
     suffix = ".dylib" if platform.system() == "Darwin" else ".so"
     so_path = csrc_dir / f"_tape_runner{suffix}"
     if not so_path.exists():
@@ -1368,7 +1368,7 @@ def evaluate_c(graph: CircuitGraph,
         elif node.op in (Op.BPE_ENCODE, Op.BPE_DECODE):
             # Delegate to the reference evaluator for BPE ops —
             # these are FSM-driven ROM lookups, not tensor math.
-            from kllm.evaluator import _eval_bpe_encode, _eval_bpe_decode
+            from kllm.graph.evaluator import _eval_bpe_encode, _eval_bpe_decode
             if node.op == Op.BPE_ENCODE:
                 values[nid] = _eval_bpe_encode(node, inp, values)
             else:

@@ -19,7 +19,7 @@ graph == output values of the original graph (bit-exact).
 
 Usage::
 
-    from kllm.graph_optimizer import optimize_graph
+    from kllm.graph.graph_optimizer import optimize_graph
     opt_graph, new_ids = optimize_graph(graph, output_ids=[logits_id])
     # new_ids maps old output IDs to new IDs in the optimized graph
 """
@@ -30,8 +30,8 @@ from copy import deepcopy
 
 import numpy as np
 
-from kllm.circuit_graph import CircuitGraph, Node, Op
-from kllm.evaluator import evaluate
+from kllm.graph.circuit_graph import CircuitGraph, Node, Op
+from kllm.graph.evaluator import evaluate
 
 
 # ---------------------------------------------------------------

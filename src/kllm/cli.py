@@ -171,12 +171,12 @@ def _build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------
 
 def _cmd_create(args) -> None:
-    from kllm.chip import Chip
+    from kllm.device.chip import Chip
     Chip.create(model_name=args.model, chip_path=args.chip_path)
 
 
 def _cmd_infer(args) -> None:
-    from kllm.chip import Chip
+    from kllm.device.chip import Chip
 
     chip = Chip.load(args.chip_path)
     prompt = _get_prompt(args)
@@ -196,7 +196,7 @@ def _cmd_infer(args) -> None:
 def _cmd_compare(args) -> None:
     from kllm.compare import compare_chip, print_generate_report
 
-    from kllm.chip import Chip
+    from kllm.device.chip import Chip
     chip = Chip.load(args.chip_path)
 
     prompt = _get_prompt(args) if args.prompt else None
@@ -205,8 +205,8 @@ def _cmd_compare(args) -> None:
 
 
 def _cmd_export_hdl(args) -> None:
-    from kllm.chip import Chip
-    from kllm.hdl_export import (
+    from kllm.device.chip import Chip
+    from kllm.hdl.hdl_export import (
         export_verilog, export_vhdl, estimate_resources,
     )
 
@@ -231,7 +231,7 @@ def _cmd_export_hdl(args) -> None:
 
 
 def _cmd_simulate_infer(args) -> None:
-    from kllm.chip import Chip
+    from kllm.device.chip import Chip
 
     chip = Chip.load(args.chip_path)
     prompt = _get_prompt(args)

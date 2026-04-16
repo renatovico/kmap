@@ -7,9 +7,9 @@ for every op type and for full compiled transformer graphs.
 import numpy as np
 import pytest
 
-from kllm.circuit_graph import CircuitGraph, Op
-from kllm.evaluator import evaluate
-from kllm.circuit_executor import evaluate_c
+from kllm.graph.circuit_graph import CircuitGraph, Op
+from kllm.graph.evaluator import evaluate
+from kllm.graph.circuit_executor import evaluate_c
 
 
 # ---------------------------------------------------------------
@@ -309,7 +309,7 @@ class TestFullGraph:
 
     def test_compiled_model_matches_reference(self):
         """Compiled graph: C eval == NumPy eval."""
-        from kllm.circuit_compiler import compile_model
+        from kllm.compiler.circuit_compiler import compile_model
         from tests.test_circuit_compiler import MockFabric
 
         fabric = MockFabric(num_layers=1, hidden_size=8, num_heads=2,

@@ -15,8 +15,8 @@ All data flows through the device's circuit tape — no Python in the loop.
 
 Usage::
 
-    from kllm.processor import Processor
-    from kllm.native_runner import NativeRunner
+    from kllm.device.processor import Processor
+    from kllm.device.native_runner import NativeRunner
 
     processor = Processor.load("./mychip")
     runner = NativeRunner(processor)
@@ -37,13 +37,13 @@ from typing import Iterator
 
 import numpy as np
 
-from kllm.circuit_executor import (
+from kllm.graph.circuit_executor import (
     CTapeRunner,
     precompute_consts,
     _get_tape_lib,
 )
-from kllm.circuit_graph import Op
-from kllm.processor import Processor
+from kllm.graph.circuit_graph import Op
+from kllm.device.processor import Processor
 
 
 # ctypes convenience

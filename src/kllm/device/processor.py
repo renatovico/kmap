@@ -27,7 +27,7 @@ Usage::
     processor.save("./mychip")
     processor = Processor.load("./mychip")
 
-    from kllm.native_runner import NativeRunner
+    from kllm.device.native_runner import NativeRunner
     runner = NativeRunner(processor)
     output_bytes = runner.infer(b"Hello world", max_tokens=50)
 """
@@ -39,18 +39,18 @@ import os
 
 import numpy as np
 
-from kllm.circuit_compiler import (
+from kllm.compiler.circuit_compiler import (
     DecodeMachine,
     compile_decode_template,
     _build_rope_const,
 )
-from kllm.circuit_graph import CircuitGraph
-from kllm.circuit_tokenizer import (
+from kllm.graph.circuit_graph import CircuitGraph
+from kllm.compiler.circuit_tokenizer import (
     compile_tokenizer_graph_from_json,
     load_roms as load_tokenizer_roms,
     TokenizerGraphMaps,
 )
-from kllm.graph_optimizer import optimize_graph
+from kllm.graph.graph_optimizer import optimize_graph
 
 
 class Processor:

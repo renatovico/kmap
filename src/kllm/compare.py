@@ -32,7 +32,7 @@ def compare_chip(
     If *text* is None, runs a standard benchmark suite
     (multiple prompts). Otherwise compares the single prompt.
     """
-    from kllm.chip import Chip
+    from kllm.device.chip import Chip
 
     # Read model_name from chip metadata
     import json

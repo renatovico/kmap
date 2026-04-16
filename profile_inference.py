@@ -3,9 +3,9 @@ import json
 import time
 import numpy as np
 
-from kllm.fabric import Fabric
-from kllm.processor import Processor
-from kllm.native_runner import NativeRunner
+from kllm.compiler.fabric import Fabric
+from kllm.device.processor import Processor
+from kllm.device.native_runner import NativeRunner
 
 fabric = Fabric("./lossless_logic")
 

@@ -27,8 +27,8 @@ import time
 
 import numpy as np
 
-from kllm.processor import Processor
-from kllm.native_runner import NativeRunner
+from kllm.device.processor import Processor
+from kllm.device.native_runner import NativeRunner
 
 
 # ------------------------------------------------------------------
@@ -92,7 +92,7 @@ class Chip:
         tokenizer, compile the decode datapath, compile tokenizer
         circuit, optimise, and serialize everything to ``chip_path``.
         """
-        from kllm.fabric import Fabric
+        from kllm.compiler.fabric import Fabric
 
         os.makedirs(chip_path, exist_ok=True)
 

@@ -21,7 +21,7 @@ Target platforms:
 
 Usage::
 
-    from kllm.hdl_export import export_verilog, export_vhdl
+    from kllm.hdl.hdl_export import export_verilog, export_vhdl
     export_verilog(graph, "output/circuit.v")
     export_vhdl(graph, "output/circuit.vhd")
 """
@@ -33,7 +33,7 @@ from datetime import datetime
 
 import numpy as np
 
-from kllm.circuit_graph import CircuitGraph, Node, Op
+from kllm.graph.circuit_graph import CircuitGraph, Node, Op
 
 
 class _StreamWriter:

@@ -15,7 +15,7 @@ import re
 
 import numpy as np
 
-from kllm.circuit_graph import CircuitGraph, Op
+from kllm.graph.circuit_graph import CircuitGraph, Op
 
 
 # LUT function registry (maps name → NumPy function)

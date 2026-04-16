@@ -70,21 +70,21 @@ class MockFabric:
             self.layers.append(layer)
 
     @lru_cache(maxsize=None)
-    def get_transposed(self, layer_idx, proj):
+    def _get_transposed(self, layer_idx, proj):
         return np.ascontiguousarray(
             self.layers[layer_idx][proj].T, dtype=np.float32)
 
     @lru_cache(maxsize=None)
-    def get_fused_qkv_t(self, layer_idx):
-        q_t = self.get_transposed(layer_idx, 'q_proj')
-        k_t = self.get_transposed(layer_idx, 'k_proj')
-        v_t = self.get_transposed(layer_idx, 'v_proj')
+    def _get_fused_qkv_t(self, layer_idx):
+        q_t = self._get_transposed(layer_idx, 'q_proj')
+        k_t = self._get_transposed(layer_idx, 'k_proj')
+        v_t = self._get_transposed(layer_idx, 'v_proj')
         return np.ascontiguousarray(np.concatenate([q_t, k_t, v_t], axis=1))
 
     @lru_cache(maxsize=None)
-    def get_fused_gate_up_t(self, layer_idx):
-        gate_t = self.get_transposed(layer_idx, 'gate_proj')
-        up_t = self.get_transposed(layer_idx, 'up_proj')
+    def _get_fused_gate_up_t(self, layer_idx):
+        gate_t = self._get_transposed(layer_idx, 'gate_proj')
+        up_t = self._get_transposed(layer_idx, 'up_proj')
         return np.ascontiguousarray(np.concatenate([gate_t, up_t], axis=1))
 
     @staticmethod
@@ -97,17 +97,17 @@ class MockFabric:
 
     @lru_cache(maxsize=None)
     def get_quantized(self, layer_idx, proj):
-        w_t = self.get_transposed(layer_idx, proj)
+        w_t = self._get_transposed(layer_idx, proj)
         return self._quantize_per_column(w_t)
 
     @lru_cache(maxsize=None)
     def get_quantized_fused_qkv(self, layer_idx):
-        w_t = self.get_fused_qkv_t(layer_idx)
+        w_t = self._get_fused_qkv_t(layer_idx)
         return self._quantize_per_column(w_t)
 
     @lru_cache(maxsize=None)
     def get_quantized_fused_gate_up(self, layer_idx):
-        w_t = self.get_fused_gate_up_t(layer_idx)
+        w_t = self._get_fused_gate_up_t(layer_idx)
         return self._quantize_per_column(w_t)
 
 

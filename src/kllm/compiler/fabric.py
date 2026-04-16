@@ -12,12 +12,11 @@ layout (``config.json``, ``embed_tokens.npy``, ``layer_<n>/``).
 
 import json
 import os
-import time
 from functools import lru_cache
 
 import numpy as np
 
-LINEAR_NAMES = (
+_LINEAR_NAMES = (
     "q_proj", "k_proj", "v_proj", "o_proj",
     "gate_proj", "up_proj", "down_proj",
 )
@@ -47,19 +46,11 @@ class Fabric:
         weights_dir = os.path.join(save_dir, "weights")
         config_path = os.path.join(weights_dir, "config.json")
 
-        # Support legacy meta.npz layout as fallback
         if not os.path.exists(config_path):
-            legacy_meta = os.path.join(save_dir, "meta.npz")
-            legacy_cache = os.path.join(save_dir, "optimized")
-            if os.path.exists(legacy_meta) and os.path.isdir(legacy_cache):
-                self._load_legacy(save_dir)
-                return
             raise FileNotFoundError(
                 f"No compiled model found at {save_dir}. "
-                "Run `kllm --mode compile` first."
+                "Run `kllm create --model <model> <path>` first."
             )
-
-        t0 = time.perf_counter()
 
         with open(config_path) as f:
             cfg = json.load(f)
@@ -76,7 +67,6 @@ class Fabric:
         self.num_groups: int = self.num_heads // self.num_kv_heads
 
         self._load_cached(weights_dir)
-        self.load_time: float = time.perf_counter() - t0
 
     def _load_cached(self, weights_dir: str) -> None:
         """Load float32 weights from .npy cache."""
@@ -97,7 +87,7 @@ class Fabric:
         for li in range(self.num_layers):
             layer_dir = os.path.join(weights_dir, f"layer_{li}")
             layer: dict[str, np.ndarray] = {}
-            for name in LINEAR_NAMES:
+            for name in _LINEAR_NAMES:
                 layer[name] = np.load(
                     os.path.join(layer_dir, f"{name}.npy"),
                 )
@@ -109,31 +99,12 @@ class Fabric:
             )
             self.layers.append(layer)
 
-    def _load_legacy(self, save_dir: str) -> None:
-        """Load from legacy meta.npz + optimized/ layout."""
-        meta = np.load(os.path.join(save_dir, "meta.npz"), allow_pickle=True)
-        self.num_layers = int(meta["num_layers"])
-        self.hidden_size = int(meta["hidden_size"])
-        self.num_heads = int(meta["num_attention_heads"])
-        self.num_kv_heads = int(meta["num_key_value_heads"])
-        self.intermediate_size = int(meta["intermediate_size"])
-        self.vocab_size = int(meta["vocab_size"])
-        self.rms_norm_eps = float(meta["rms_norm_eps"])
-        self.rope_theta = float(meta["rope_theta"])
-        self.head_dim = self.hidden_size // self.num_heads
-        self.num_groups = self.num_heads // self.num_kv_heads
-
-        cache_dir = os.path.join(save_dir, "optimized")
-        t0 = time.perf_counter()
-        self._load_cached(cache_dir)
-        self.load_time = time.perf_counter() - t0
-
     # ------------------------------------------------------------------
     # Transposed-weight cache (shared across all compile calls)
     # ------------------------------------------------------------------
 
     @lru_cache(maxsize=None)
-    def get_transposed(self, layer_idx: int, proj: str) -> np.ndarray:
+    def _get_transposed(self, layer_idx: int, proj: str) -> np.ndarray:
         """Return ``layers[layer_idx][proj].T`` as contiguous float32.
 
         Results are cached so that ``compile_model`` and
@@ -144,27 +115,27 @@ class Fabric:
             self.layers[layer_idx][proj].T, dtype=np.float32)
 
     @lru_cache(maxsize=None)
-    def get_fused_qkv_t(self, layer_idx: int) -> np.ndarray:
+    def _get_fused_qkv_t(self, layer_idx: int) -> np.ndarray:
         """Return ``[Wq | Wk | Wv].T`` — fused QKV weight matrix.
 
         Shape: (hidden_size, q_dim + kv_dim + kv_dim).
         One matmul replaces three separate Q/K/V projections.
         """
-        q_t = self.get_transposed(layer_idx, "q_proj")
-        k_t = self.get_transposed(layer_idx, "k_proj")
-        v_t = self.get_transposed(layer_idx, "v_proj")
+        q_t = self._get_transposed(layer_idx, "q_proj")
+        k_t = self._get_transposed(layer_idx, "k_proj")
+        v_t = self._get_transposed(layer_idx, "v_proj")
         return np.ascontiguousarray(
             np.concatenate([q_t, k_t, v_t], axis=1))
 
     @lru_cache(maxsize=None)
-    def get_fused_gate_up_t(self, layer_idx: int) -> np.ndarray:
+    def _get_fused_gate_up_t(self, layer_idx: int) -> np.ndarray:
         """Return ``[Wgate | Wup].T`` — fused Gate+Up weight matrix.
 
         Shape: (hidden_size, 2 * intermediate_size).
         One matmul replaces two separate gate/up projections.
         """
-        gate_t = self.get_transposed(layer_idx, "gate_proj")
-        up_t = self.get_transposed(layer_idx, "up_proj")
+        gate_t = self._get_transposed(layer_idx, "gate_proj")
+        up_t = self._get_transposed(layer_idx, "up_proj")
         return np.ascontiguousarray(
             np.concatenate([gate_t, up_t], axis=1))
 
@@ -214,7 +185,7 @@ class Fabric:
         """
         return self._load_or_quantize(
             f"L{layer_idx}_{proj}",
-            lambda: self.get_transposed(layer_idx, proj))
+            lambda: self._get_transposed(layer_idx, proj))
 
     @lru_cache(maxsize=None)
     def get_quantized_fused_qkv(self, layer_idx: int
@@ -222,7 +193,7 @@ class Fabric:
         """Return ``(W_q8, scales)`` for fused QKV (transposed)."""
         return self._load_or_quantize(
             f"L{layer_idx}_fused_qkv",
-            lambda: self.get_fused_qkv_t(layer_idx))
+            lambda: self._get_fused_qkv_t(layer_idx))
 
     @lru_cache(maxsize=None)
     def get_quantized_fused_gate_up(self, layer_idx: int
@@ -230,7 +201,7 @@ class Fabric:
         """Return ``(W_q8, scales)`` for fused GateUp (transposed)."""
         return self._load_or_quantize(
             f"L{layer_idx}_fused_gate_up",
-            lambda: self.get_fused_gate_up_t(layer_idx))
+            lambda: self._get_fused_gate_up_t(layer_idx))
 
     # ------------------------------------------------------------------
     # Class method: download from HuggingFace and cache

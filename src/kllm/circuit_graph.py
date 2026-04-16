@@ -480,6 +480,19 @@ class CircuitGraph:
                 f.write(struct.pack("<I", len(param_bytes)))
                 f.write(param_bytes)
 
+        # Node shape/dtype/name metadata (separate file for compat)
+        import json as _json
+        node_meta_list = []
+        for node in self.nodes:
+            node_meta_list.append({
+                "id": node.id,
+                "shape": list(node.shape) if node.shape else None,
+                "dtype": str(node.dtype),
+                "name": node.name,
+            })
+        with open(os.path.join(path, "node_meta.json"), "w") as mf:
+            _json.dump(node_meta_list, mf)
+
         # Topological order
         order_arr = np.array(order, dtype=np.uint32)
         order_arr.tofile(os.path.join(path, "topo.bin"))
@@ -509,6 +522,14 @@ class CircuitGraph:
         g = cls()
         op_list = list(Op)
 
+        # Load node shape/dtype metadata if available (newer format)
+        meta_by_id: dict[int, dict] = {}
+        meta_path = os.path.join(path, "node_meta.json")
+        if os.path.exists(meta_path):
+            with open(meta_path) as mf:
+                for entry in json.load(mf):
+                    meta_by_id[entry["id"]] = entry
+
         with open(os.path.join(path, "nodes.bin"), "rb") as f:
             num_nodes = struct.unpack("<I", f.read(4))[0]
             for _ in range(num_nodes):
@@ -521,19 +542,31 @@ class CircuitGraph:
 
                 op = op_list[op_idx]
 
+                # Restore shape/dtype/name from metadata
+                nm = meta_by_id.get(nid, {})
+                node_shape = tuple(nm["shape"]) if nm.get("shape") else None
+                node_dtype = np.dtype(nm.get("dtype", "float32"))
+                node_name = nm.get("name", "")
+
                 # Load const data
                 if op == Op.CONST:
                     const_path = os.path.join(path, f"const_{nid}.bin")
-                    meta_path = os.path.join(path, f"const_{nid}.json")
+                    const_meta_path = os.path.join(
+                        path, f"const_{nid}.json")
                     if os.path.exists(const_path):
-                        with open(meta_path) as mf:
-                            meta = json.load(mf)
-                        dtype = np.dtype(meta["dtype"])
-                        shape = tuple(meta["shape"])
+                        with open(const_meta_path) as cmf:
+                            cmeta = json.load(cmf)
+                        dtype = np.dtype(cmeta["dtype"])
+                        shape = tuple(cmeta["shape"])
                         data = np.fromfile(const_path, dtype=dtype)
                         params["value"] = data.reshape(shape)
+                        node_shape = shape
+                        node_dtype = dtype
 
-                node = Node(id=nid, op=op, inputs=inputs, params=params)
+                node = Node(
+                    id=nid, op=op, inputs=inputs, params=params,
+                    shape=node_shape, dtype=node_dtype, name=node_name,
+                )
                 g.nodes.append(node)
                 g._next_id = max(g._next_id, nid + 1)
 

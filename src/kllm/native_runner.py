@@ -106,6 +106,11 @@ class NativeRunner:
             m.byte_length: byte_length,
         }
 
+        # The combined graph has decode INPUT nodes too — provide zeros
+        max_tokens = g.nodes[m.dec_token_ids].shape[0]
+        inputs[m.dec_token_ids] = np.zeros(max_tokens, dtype=np.int32)
+        inputs[m.dec_num_tokens] = np.zeros(1, dtype=np.int32)
+
         # Evaluate the encode subgraph
         values = evaluate_c(g, inputs, const_cache=self._tok_const_cache)
         token_ids = values[m.token_ids]
@@ -139,6 +144,11 @@ class NativeRunner:
             m.dec_token_ids: ids_padded,
             m.dec_num_tokens: np.array([n], dtype=np.int32),
         }
+
+        # The combined graph has encode INPUT nodes too — provide zeros
+        max_bytes = g.nodes[m.byte_input].shape[0]
+        inputs[m.byte_input] = np.zeros(max_bytes, dtype=np.uint8)
+        inputs[m.byte_length] = np.zeros(1, dtype=np.int32)
 
         values = evaluate_c(g, inputs, const_cache=self._tok_const_cache)
         byte_output = values[m.dec_byte_output]

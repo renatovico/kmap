@@ -1,16 +1,17 @@
-"""NativeRunner — CPU simulation of the Processor.
+"""NativeRunner — C virtual processor for chip simulation.
 
-The NativeRunner drives the compiled Processor's datapath on the host
-CPU, executing the same sequence of operations that the FPGA FSM would:
+The NativeRunner is the CPU emulation of the compiled Processor chip.
+Everything runs in C — tokenization, prefill, decode, detokenization,
+KV cache management. Python is only the thin ctypes bridge.
 
-1. **Tokenize** — BPE encode via the circuit tokenizer graph.
-2. **Prefill** — feed each prompt token through the datapath.
-3. **Decode** — autoregressive generation (embed → RoPE → datapath →
-   argmax → KV update → repeat).
-4. **Detokenize** — BPE decode via the circuit tokenizer graph.
+The execution path mirrors what the physical FPGA would do:
 
-All data flows through the device's circuit graphs — no external
-Python libraries in the loop.
+1. BPE encode raw UTF-8 bytes → token IDs  (C)
+2. Prefill prompt tokens through the datapath circuit  (C)
+3. Autoregressive decode: embed → RoPE → tape_run → argmax → KV update  (C)
+4. BPE decode each generated token → UTF-8 bytes  (C)
+
+All data flows through the device's circuit tape — no Python in the loop.
 
 Usage::
 
@@ -19,318 +20,196 @@ Usage::
 
     processor = Processor.load("./mychip")
     runner = NativeRunner(processor)
-    output_bytes = runner.infer(b"Hello world", max_tokens=50)
+
+    # Streaming (bytes in, bytes out — each chunk as generated):
+    for chunk in runner.infer_bytes_streaming(b"Hello world", max_tokens=50):
+        sys.stdout.buffer.write(chunk)
+
+    # Batch:
+    result = runner.infer_bytes(b"Hello world", max_tokens=50)
 """
 
 from __future__ import annotations
 
-import hashlib
-import re
+import ctypes
 import sys
+from typing import Iterator
 
 import numpy as np
 
 from kllm.circuit_executor import (
-    ExecutionPlan,
     CTapeRunner,
-    evaluate_c,
     precompute_consts,
+    _get_tape_lib,
 )
+from kllm.circuit_graph import Op
 from kllm.processor import Processor
 
 
+# ctypes convenience
+_FP = ctypes.POINTER(ctypes.c_float)
+_IP = ctypes.POINTER(ctypes.c_int)
+_BP = ctypes.POINTER(ctypes.c_ubyte)
+_I32P = ctypes.POINTER(ctypes.c_int32)
+
+# Callback type matching C: int (*)(const uint8_t*, int, void*)
+_CALLBACK_TYPE = ctypes.CFUNCTYPE(
+    ctypes.c_int,           # return: 0=continue, non-zero=stop
+    ctypes.POINTER(ctypes.c_ubyte),  # bytes
+    ctypes.c_int,           # byte_len
+    ctypes.c_void_p,        # user_data
+)
+
+
+def _int_arr(vals):
+    """Create a ctypes int array from a Python sequence."""
+    return (ctypes.c_int * len(vals))(*vals)
+
+
 class NativeRunner:
-    """Run a Processor natively on the CPU — the virtual device.
+    """C virtual processor — emulates the chip entirely in C.
 
-    The NativeRunner is the CPU simulation of the chip.  It executes
-    the same sequence of operations that the FPGA FSM would:
-
-    1. **Tokenize** — BPE encode using on-chip circuit tokenizer graph.
-    2. **Prefill** — feed each prompt token through the datapath.
-    3. **Decode** — autoregressive generation (embed → RoPE → datapath →
-       argmax → KV update → repeat).
-    4. **Detokenize** — BPE decode using on-chip circuit tokenizer graph.
-
-    All data flows through the device's circuit graphs — no external
-    Python libraries in the loop.
+    All inference runs through ``processor_infer_bytes()`` in the C
+    tape runner. Python only marshals data in/out via ctypes.
     """
 
     def __init__(self, processor: Processor) -> None:
         self.proc = processor
+
+        # Load the C tape runner library
+        self._lib = _get_tape_lib()
+        if not hasattr(self._lib, 'processor_infer_bytes'):
+            raise RuntimeError(
+                "C tape runner missing processor_infer_bytes(). "
+                "Recompile csrc/_tape_runner.c.")
+
+        # Pre-compute datapath constants and build the C tape runner
         self._const_cache = precompute_consts(processor.datapath)
-        self._plan = ExecutionPlan(processor.datapath, self._const_cache)
-        self._c_runner: CTapeRunner | None = None
-        self._c_infer_available = False
-        self._tape_lib = None
 
-        # Pre-evaluate tokenizer graph constants
-        self._tok_const_cache = None
-        if processor.tokenizer_graph is not None:
-            self._tok_const_cache = precompute_consts(
-                processor.tokenizer_graph)
+        # Bootstrap CTapeRunner with a sample input (size-1 KV cache
+        # to avoid zero-dim issues during tape compilation)
+        sample = self._build_sample_inputs()
+        self._c_runner = CTapeRunner(
+            processor.datapath, self._const_cache,
+            sample_inputs=sample)
 
-        # Check if C processor_infer is available
-        try:
-            from kllm.circuit_executor import _get_tape_lib
-            self._tape_lib = _get_tape_lib()
-            if hasattr(self._tape_lib, 'processor_infer'):
-                self._c_infer_available = True
-        except Exception:
-            pass
+        # Extract BPE ROM arrays from the tokenizer circuit graph
+        self._bpe_roms = self._extract_bpe_roms()
 
     # ------------------------------------------------------------------
-    # On-chip tokenize / detokenize (circuit graph-based)
+    # Internal: extract BPE ROM data from tokenizer graph CONST nodes
     # ------------------------------------------------------------------
 
-    def encode_bytes(self, raw_bytes: bytes) -> tuple[np.ndarray, int]:
-        """Encode raw UTF-8 bytes to token IDs via circuit tokenizer.
-
-        Returns (token_ids array, num_tokens count).
-        """
+    def _extract_bpe_roms(self) -> dict[str, np.ndarray]:
+        """Pull ROM arrays from the tokenizer circuit graph's CONST nodes."""
         p = self.proc
-        if p.tokenizer_graph is None or p.tokenizer_maps is None:
-            raise RuntimeError("No tokenizer circuit on this processor")
+        if p.tokenizer_graph is None:
+            return {}
 
-        m = p.tokenizer_maps
         g = p.tokenizer_graph
+        consts = precompute_consts(g)
 
-        # Prepare inputs — max-capacity padded buffer
-        max_bytes = g.nodes[m.byte_input].shape[0]
-        byte_input = np.zeros(max_bytes, dtype=np.uint8)
-        n = min(len(raw_bytes), max_bytes)
-        byte_input[:n] = list(raw_bytes[:n])
-        byte_length = np.array([n], dtype=np.int32)
-
-        inputs = {
-            m.byte_input: byte_input,
-            m.byte_length: byte_length,
-        }
-
-        # The combined graph has decode INPUT nodes too — provide zeros
-        max_tokens = g.nodes[m.dec_token_ids].shape[0]
-        inputs[m.dec_token_ids] = np.zeros(max_tokens, dtype=np.int32)
-        inputs[m.dec_num_tokens] = np.zeros(1, dtype=np.int32)
-
-        # Evaluate the encode subgraph
-        values = evaluate_c(g, inputs, const_cache=self._tok_const_cache)
-        token_ids = values[m.token_ids]
-        num_tokens = int(values[m.num_tokens].flat[0])
-
-        return token_ids, num_tokens
-
-    def decode_to_bytes(
-        self,
-        token_ids: np.ndarray,
-        num_tokens: int,
-    ) -> bytes:
-        """Decode token IDs to UTF-8 bytes via circuit tokenizer.
-
-        Returns the raw output bytes.
-        """
-        p = self.proc
-        if p.tokenizer_graph is None or p.tokenizer_maps is None:
-            raise RuntimeError("No tokenizer circuit on this processor")
-
-        m = p.tokenizer_maps
-        g = p.tokenizer_graph
-
-        # Prepare inputs
-        max_tokens = g.nodes[m.dec_token_ids].shape[0]
-        ids_padded = np.zeros(max_tokens, dtype=np.int32)
-        n = min(num_tokens, max_tokens)
-        ids_padded[:n] = token_ids[:n]
-
-        inputs = {
-            m.dec_token_ids: ids_padded,
-            m.dec_num_tokens: np.array([n], dtype=np.int32),
-        }
-
-        # The combined graph has encode INPUT nodes too — provide zeros
-        max_bytes = g.nodes[m.byte_input].shape[0]
-        inputs[m.byte_input] = np.zeros(max_bytes, dtype=np.uint8)
-        inputs[m.byte_length] = np.zeros(1, dtype=np.int32)
-
-        values = evaluate_c(g, inputs, const_cache=self._tok_const_cache)
-        byte_output = values[m.dec_byte_output]
-        byte_length = int(values[m.dec_byte_length].flat[0])
-
-        return bytes(byte_output[:byte_length])
-
-    # ------------------------------------------------------------------
-    # Legacy ROM-based decode (backward compat for old chips)
-    # ------------------------------------------------------------------
-
-    def decode_token(self, token_id: int) -> str:
-        """Decode a single token ID to a string using on-chip ROMs."""
-        roms = self.proc.tokenizer_roms
-        if not roms:
-            raise RuntimeError("No tokenizer ROMs on this processor")
-
-        offsets = roms["id_to_offsets"]
-        raw_bytes = roms["id_to_bytes"]
-        vocab_size = int(roms["vocab_size"][0])
-
-        if token_id < 0 or token_id >= vocab_size:
-            return ""
-        offset, length = int(offsets[token_id, 0]), int(offsets[token_id, 1])
-        if length == 0:
-            return ""
-        tok_bytes = bytes(raw_bytes[offset:offset + length])
-        return tok_bytes.decode("utf-8", errors="replace")
-
-    def decode_tokens(
-        self,
-        token_ids: list[int],
-        skip_special: bool = True,
-    ) -> str:
-        """Decode a list of token IDs to text using on-chip ROMs."""
-        roms = self.proc.tokenizer_roms
-        if not roms:
-            raise RuntimeError("No tokenizer ROMs on this processor")
-
-        special_ids = set(roms.get("special_ids", np.array([], dtype=np.int32)).tolist())
-        meta = "▁"  # metaspace replacement
-
-        pieces = []
-        for tid in token_ids:
-            if skip_special and tid in special_ids:
+        roms: dict[str, np.ndarray] = {}
+        for nid, node in enumerate(g.nodes):
+            if node is None or node.op != Op.CONST:
                 continue
-            pieces.append(self.decode_token(tid))
+            name = node.name or ""
+            if name in ("vocab_hash_keys", "vocab_hash_vals",
+                        "vocab_hash_lens", "merge_a", "merge_b",
+                        "merge_result", "special_ids",
+                        "id_to_bytes", "id_to_offsets"):
+                roms[name] = np.ascontiguousarray(consts[nid])
+        return roms
 
-        text = "".join(pieces)
-        # Byte-fallback decoding
-        byte_pattern = re.compile(r"(<0x[0-9A-Fa-f]{2}>)+")
-        def _decode_bytes(match):
-            hex_tokens = re.findall(r"<0x([0-9A-Fa-f]{2})>", match.group())
-            return bytes(int(h, 16) for h in hex_tokens).decode("utf-8", errors="replace")
-        text = byte_pattern.sub(_decode_bytes, text)
-        # Undo metaspace
-        text = text.replace(meta, " ")
-        if text.startswith(" "):
-            text = text[1:]
-        return text
-
-    def _ensure_c_runner(self, sample_inputs: dict[int, np.ndarray]) -> None:
-        """Lazy-init the C tape runner (needed for both paths)."""
-        if self._c_runner is None:
-            try:
-                self._c_runner = CTapeRunner(
-                    self.proc.datapath, self._const_cache,
-                    sample_inputs=sample_inputs)
-            except Exception:
-                pass
-
-    def _build_inputs(
-        self,
-        token_id: int,
-        position: int,
-        kv_cache: list[tuple[np.ndarray, np.ndarray]],
-    ) -> dict[int, np.ndarray]:
-        """Prepare INPUT node values for one forward pass."""
+    def _build_sample_inputs(self) -> dict[int, np.ndarray]:
+        """Build sample inputs with size-1 KV cache for tape bootstrap."""
         p = self.proc
-        token_embed = p.embed_table[token_id:token_id + 1].astype(np.float32)
-        rope_cos = p.rope_cos[position:position + 1]
-        rope_sin = p.rope_sin[position:position + 1]
+        token_embed = p.embed_table[0:1].astype(np.float32)
+        rope_cos = p.rope_cos[0:1]
+        rope_sin = p.rope_sin[0:1]
 
         inputs: dict[int, np.ndarray] = {
             p.input_map["token_embed"]: token_embed,
             p.input_map["rope_cos"]: rope_cos,
             p.input_map["rope_sin"]: rope_sin,
         }
+        # Use size-1 KV cache (not zero!) so shapes are non-degenerate
         for li in range(p.num_layers):
-            k_cache, v_cache = kv_cache[li]
-            inputs[p.input_map[f"L{li}/cache_k"]] = k_cache
-            inputs[p.input_map[f"L{li}/cache_v"]] = v_cache
+            kv = np.zeros((p.num_kv_heads, 1, p.head_dim), dtype=np.float32)
+            inputs[p.input_map[f"L{li}/cache_k"]] = kv.copy()
+            inputs[p.input_map[f"L{li}/cache_v"]] = kv.copy()
 
         return inputs
 
-    def _run_datapath(
+    # ------------------------------------------------------------------
+    # Public API: bytes-in → bytes-out (all in C)
+    # ------------------------------------------------------------------
+
+    def infer_bytes(self, input_bytes: bytes, max_tokens: int) -> bytes:
+        """Full inference: raw UTF-8 bytes in → raw UTF-8 bytes out.
+
+        Everything runs in one C call. Returns all output bytes at once.
+        """
+        chunks: list[bytes] = []
+        for chunk in self.infer_bytes_streaming(input_bytes, max_tokens):
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    def infer_bytes_streaming(
         self,
-        inputs: dict[int, np.ndarray],
-    ) -> dict[int, np.ndarray]:
-        """Execute one forward pass through the datapath."""
-        self._ensure_c_runner(inputs)
-
-        if self._c_runner is not None:
-            self._c_runner.run(inputs)
-            return {
-                nid: self._c_runner.get_value(nid)
-                for nid in self.proc.output_map.values()
-            }
-        else:
-            return self._plan.run(inputs)
-
-    def _extract_kv(
-        self, values: dict[int, np.ndarray],
-    ) -> list[tuple[np.ndarray, np.ndarray]]:
-        """Extract new KV cache arrays from datapath outputs."""
-        kv = []
-        for li in range(self.proc.num_layers):
-            k = np.asarray(values[self.proc.output_map[f"L{li}/new_k"]])
-            v = np.asarray(values[self.proc.output_map[f"L{li}/new_v"]])
-            kv.append((k, v))
-        return kv
-
-    def _clamp_max_tokens(
-        self,
-        prompt_len: int,
+        input_bytes: bytes,
         max_tokens: int,
-    ) -> int:
-        """Clamp max_tokens so total sequence stays within max_seq_len."""
-        limit = self.proc.max_seq_len - prompt_len
-        if limit <= 0:
-            print(f"[warning] prompt length ({prompt_len}) already at or "
-                  f"beyond max_seq_len ({self.proc.max_seq_len}); "
-                  f"cannot generate new tokens",
-                  file=sys.stderr)
-            return 0
-        if max_tokens > limit:
-            print(f"[warning] max_tokens ({max_tokens}) + prompt ({prompt_len}) "
-                  f"exceeds max_seq_len ({self.proc.max_seq_len}); "
-                  f"clamping to {limit} new tokens",
-                  file=sys.stderr)
-            return limit
-        return max_tokens
+    ) -> Iterator[bytes]:
+        """Yield decoded byte chunks as each token is generated.
 
-    def _infer_c(
-        self,
-        prompt_tokens: list[int],
-        max_tokens: int,
-    ) -> list[int]:
-        """Run full inference via single C processor_infer() call."""
-        import ctypes
+        The entire inference loop (BPE encode → prefill → decode →
+        BPE decode per token) runs in C. A ctypes callback yields
+        each decoded chunk back to Python.
+        """
+        if not input_bytes:
+            return
+
+        roms = self._bpe_roms
+        if not roms:
+            raise RuntimeError(
+                "No BPE ROMs found in tokenizer circuit. "
+                "Re-create chip with `kllm create`.")
 
         p = self.proc
-        lib = self._tape_lib
-
-        # We need a CTapeRunner's ctx — bootstrap it with a sample input
-        kv_empty = np.zeros((p.num_kv_heads, 0, p.head_dim), dtype=np.float32)
-        kv_cache = [(kv_empty.copy(), kv_empty.copy())
-                    for _ in range(p.num_layers)]
-        sample = self._build_inputs(prompt_tokens[0] if prompt_tokens else 0,
-                                    0, kv_cache)
-        self._ensure_c_runner(sample)
-
-        if self._c_runner is None:
-            # Fall back to Python loop
-            return self._infer_python(prompt_tokens, max_tokens)
-
+        lib = self._lib
         ctx = self._c_runner._ctx
 
-        # Prepare contiguous arrays for C
+        # Marshal BPE ROM pointers
+        hash_keys = roms["vocab_hash_keys"]
+        hash_vals = np.ascontiguousarray(roms["vocab_hash_vals"], dtype=np.int32)
+        hash_lens = np.ascontiguousarray(roms["vocab_hash_lens"], dtype=np.int32)
+        merge_a = np.ascontiguousarray(roms["merge_a"], dtype=np.int32)
+        merge_b = np.ascontiguousarray(roms["merge_b"], dtype=np.int32)
+        merge_result = np.ascontiguousarray(roms["merge_result"], dtype=np.int32)
+        id_to_bytes_rom = np.ascontiguousarray(roms["id_to_bytes"], dtype=np.uint8)
+        id_to_offsets = np.ascontiguousarray(roms["id_to_offsets"], dtype=np.int32)
+        special_ids = np.ascontiguousarray(roms["special_ids"], dtype=np.int32)
+
+        table_size = hash_keys.shape[0]
+        max_piece_len = hash_keys.shape[1]
+        num_merges = len(merge_a)
+        num_special = len(special_ids)
+
+        # BOS token ID (second special token = 1 for LLaMA-family models)
+        bos_token_id = 1
+        if num_special > 1:
+            bos_token_id = int(special_ids[1])
+
+        # Processor resources
         embed = np.ascontiguousarray(p.embed_table, dtype=np.float32)
         rope_cos = np.ascontiguousarray(p.rope_cos, dtype=np.float32)
         rope_sin = np.ascontiguousarray(p.rope_sin, dtype=np.float32)
-
-        FP = ctypes.POINTER(ctypes.c_float)
-        IP = ctypes.POINTER(ctypes.c_int)
 
         # Slot mappings
         token_embed_slot = p.input_map["token_embed"]
         rope_cos_slot = p.input_map["rope_cos"]
         rope_sin_slot = p.input_map["rope_sin"]
 
-        # KV slot arrays: [K_in_L0, V_in_L0, K_in_L1, V_in_L1, ...]
         kv_in = []
         kv_out = []
         for li in range(p.num_layers):
@@ -339,251 +218,71 @@ class NativeRunner:
             kv_out.append(p.output_map[f"L{li}/new_k"])
             kv_out.append(p.output_map[f"L{li}/new_v"])
 
-        kv_in_arr = (ctypes.c_int * len(kv_in))(*kv_in)
-        kv_out_arr = (ctypes.c_int * len(kv_out))(*kv_out)
-
         logits_slot = p.output_map["logits"]
 
-        # Prompt tokens
-        prompt_arr = (ctypes.c_int * len(prompt_tokens))(*prompt_tokens)
+        # Input bytes as contiguous buffer
+        input_buf = np.frombuffer(input_bytes, dtype=np.uint8).copy()
 
-        # Output buffer
-        output_arr = (ctypes.c_int * max_tokens)()
-        output_len = ctypes.c_int(0)
+        # Collect chunks from C callback
+        chunks: list[bytes] = []
 
-        lib.processor_infer(
+        @_CALLBACK_TYPE
+        def _on_token(byte_ptr, byte_len, _user_data):
+            if byte_len > 0:
+                chunk = bytes(byte_ptr[:byte_len])
+                chunks.append(chunk)
+            return 0
+
+        # prevent GC
+        self._callback_ref = _on_token
+
+        total_generated = ctypes.c_int(0)
+        max_bpe_bytes = 8192
+
+        lib.processor_infer_bytes(
             ctx,
-            embed.ctypes.data_as(FP),
+            # BPE ROMs
+            hash_keys.ctypes.data_as(_BP),
+            hash_vals.ctypes.data_as(_I32P),
+            hash_lens.ctypes.data_as(_I32P),
+            table_size, max_piece_len,
+            merge_a.ctypes.data_as(_I32P),
+            merge_b.ctypes.data_as(_I32P),
+            merge_result.ctypes.data_as(_I32P),
+            num_merges,
+            id_to_bytes_rom.ctypes.data_as(_BP),
+            id_to_offsets.ctypes.data_as(_I32P),
+            special_ids.ctypes.data_as(_I32P),
+            num_special,
+            bos_token_id,
+            # Processor resources
+            embed.ctypes.data_as(_FP),
             p.vocab_size,
             p.hidden_dim,
-            rope_cos.ctypes.data_as(FP),
-            rope_sin.ctypes.data_as(FP),
+            rope_cos.ctypes.data_as(_FP),
+            rope_sin.ctypes.data_as(_FP),
             p.head_dim,
+            # Slot mappings
             token_embed_slot,
             rope_cos_slot,
             rope_sin_slot,
-            kv_in_arr,
-            kv_out_arr,
+            _int_arr(kv_in),
+            _int_arr(kv_out),
             logits_slot,
             p.num_layers,
             p.num_kv_heads,
-            prompt_arr,
-            len(prompt_tokens),
+            # Inference params
+            input_buf.ctypes.data_as(_BP),
+            len(input_bytes),
             max_tokens,
             p.eos_token_id,
-            output_arr,
-            ctypes.byref(output_len),
+            p.max_seq_len,
+            max_bpe_bytes,
+            # Callback
+            _on_token,
+            None,
+            # Output
+            ctypes.byref(total_generated),
         )
 
-        return [output_arr[i] for i in range(output_len.value)]
-
-    def _infer_python(
-        self,
-        prompt_tokens: list[int],
-        max_tokens: int,
-    ) -> list[int]:
-        """Fallback: Python-driven inference loop."""
-        p = self.proc
-
-        kv_cache: list[tuple[np.ndarray, np.ndarray]] = []
-        for _ in range(p.num_layers):
-            kv_cache.append((
-                np.zeros((p.num_kv_heads, 0, p.head_dim), dtype=np.float32),
-                np.zeros((p.num_kv_heads, 0, p.head_dim), dtype=np.float32),
-            ))
-
-        logits = None
-        for pos, token_id in enumerate(prompt_tokens):
-            inputs = self._build_inputs(token_id, pos, kv_cache)
-            values = self._run_datapath(inputs)
-            kv_cache = self._extract_kv(values)
-            logits = values[p.output_map["logits"]]
-
-        if logits is None:
-            return []
-
-        position = len(prompt_tokens)
-        generated: list[int] = []
-
-        for _ in range(max_tokens):
-            if position >= p.max_seq_len:
-                break
-            next_id = int(np.argmax(logits[-1]))
-            if next_id == p.eos_token_id:
-                break
-            generated.append(next_id)
-
-            inputs = self._build_inputs(next_id, position, kv_cache)
-            values = self._run_datapath(inputs)
-            kv_cache = self._extract_kv(values)
-            logits = values[p.output_map["logits"]]
-            position += 1
-
-        return generated
-
-    def infer(
-        self,
-        prompt_tokens: list[int],
-        max_tokens: int,
-    ) -> list[int]:
-        """Run full inference: prefill + autoregressive decode.
-
-        Uses C processor_infer() when available (zero Python between
-        tokens), falls back to Python loop otherwise.
-
-        Returns the list of generated token IDs (not including prompt).
-        """
-        if not prompt_tokens:
-            return []
-
-        max_tokens = self._clamp_max_tokens(len(prompt_tokens), max_tokens)
-        if max_tokens <= 0:
-            return []
-
-        if self._c_infer_available:
-            return self._infer_c(prompt_tokens, max_tokens)
-        return self._infer_python(prompt_tokens, max_tokens)
-
-    def infer_bytes(
-        self,
-        input_bytes: bytes,
-        max_tokens: int,
-    ) -> bytes:
-        """Bytes-in, bytes-out inference through the circuit.
-
-        The full loop runs through circuit graphs:
-        1. BPE encode via tokenizer circuit (bytes → token IDs)
-        2. Prefill + decode via datapath circuit
-        3. BPE decode via tokenizer circuit (token IDs → bytes)
-
-        This is the primary API — the same path the hardware FSM takes.
-        """
-        if not input_bytes:
-            return b""
-
-        # 1. Tokenize via circuit
-        token_ids_arr, num_tokens = self.encode_bytes(input_bytes)
-        prompt_tokens = token_ids_arr[:num_tokens].tolist()
-
-        if not prompt_tokens:
-            return b""
-
-        # 2. Run inference (prefill + decode)
-        generated = self.infer(prompt_tokens, max_tokens)
-
-        if not generated:
-            return b""
-
-        # 3. Detokenize via circuit
-        gen_arr = np.array(generated, dtype=np.int32)
-        return self.decode_to_bytes(gen_arr, len(generated))
-
-    def infer_streaming(
-        self,
-        prompt_tokens: list[int],
-        max_tokens: int,
-    ):
-        """Yield generated token IDs one at a time (for live output).
-
-        Note: streaming always uses the Python loop (needs to yield
-        between tokens). For batch inference, use infer() which runs
-        entirely in C.
-        """
-        if not prompt_tokens:
-            return
-
-        max_tokens = self._clamp_max_tokens(len(prompt_tokens), max_tokens)
-        if max_tokens <= 0:
-            return
-
-        p = self.proc
-
-        kv_cache: list[tuple[np.ndarray, np.ndarray]] = []
-        for _ in range(p.num_layers):
-            kv_cache.append((
-                np.zeros((p.num_kv_heads, 0, p.head_dim), dtype=np.float32),
-                np.zeros((p.num_kv_heads, 0, p.head_dim), dtype=np.float32),
-            ))
-
-        logits = None
-        for pos, token_id in enumerate(prompt_tokens):
-            inputs = self._build_inputs(token_id, pos, kv_cache)
-            values = self._run_datapath(inputs)
-            kv_cache = self._extract_kv(values)
-            logits = values[p.output_map["logits"]]
-
-        if logits is None:
-            return
-
-        position = len(prompt_tokens)
-        for _ in range(max_tokens):
-            if position >= p.max_seq_len:
-                break
-            next_id = int(np.argmax(logits[-1]))
-            if next_id == p.eos_token_id:
-                break
-            yield next_id
-
-            inputs = self._build_inputs(next_id, position, kv_cache)
-            values = self._run_datapath(inputs)
-            kv_cache = self._extract_kv(values)
-            logits = values[p.output_map["logits"]]
-            position += 1
-
-    def infer_bytes_streaming(
-        self,
-        input_bytes: bytes,
-        max_tokens: int,
-    ):
-        """Yield generated bytes chunks as they're produced.
-
-        Bytes-in, each yield is a bytes chunk for one decoded token.
-        """
-        if not input_bytes:
-            return
-
-        # 1. Tokenize via circuit
-        token_ids_arr, num_tokens = self.encode_bytes(input_bytes)
-        prompt_tokens = token_ids_arr[:num_tokens].tolist()
-
-        if not prompt_tokens:
-            return
-
-        # 2. Stream decode tokens
-        for tok_id in self.infer_streaming(prompt_tokens, max_tokens):
-            # Decode individual token via circuit
-            tok_arr = np.array([tok_id], dtype=np.int32)
-            chunk = self.decode_to_bytes(tok_arr, 1)
-            yield chunk
-
-
-# ---------------------------------------------------------------
-# Prefix cache — shared across NativeRunner instances
-# ---------------------------------------------------------------
-
-_PREFIX_CACHE: dict[str, tuple[list[tuple[np.ndarray, np.ndarray]], int, np.ndarray]] = {}
-
-
-def _prefix_hash(token_ids: list[int]) -> str:
-    """Hash a token prefix for cache lookup."""
-    data = np.array(token_ids, dtype=np.int32).tobytes()
-    return hashlib.sha256(data).hexdigest()[:16]
-
-
-def cached_infer(
-    processor: Processor,
-    prompt_tokens: list[int],
-    max_tokens: int,
-) -> list[int]:
-    """Inference with prefix caching.
-
-    If the same prompt prefix was already prefilled, reuse the KV cache
-    and skip straight to decode.
-    """
-    runner = NativeRunner(processor)
-    return runner.infer(prompt_tokens, max_tokens)
-
-
-def clear_prefix_cache() -> None:
-    """Clear the prefix cache."""
-    _PREFIX_CACHE.clear()
+        yield from chunks

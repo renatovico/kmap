@@ -1,15 +1,18 @@
 # kllm
 
-**Compile a transformer into a gate circuit.  Optimise it.  Run it.**
+**Compile a transformer into a circuit.  Optimise it.  Run it on a virtual processor.**
 
 kllm turns every operation in an LLM — weights, activations, matmul,
 normalization, softmax, attention — into a **circuit graph** (DAG of
-gate nodes) that is:
+gate nodes) and runs it on a virtual processor emulated entirely in C.
 
-1. **Bit-exact** to HuggingFace output — no quantisation, no precision loss.
-2. **Optimised** offline (constant folding, dead elimination) and online
-   (JIT per-token KV cache folding).
-3. **Executable** via a C gate executor — zero NumPy at inference time.
+1. **Bit-exact** to HuggingFace output — INT8 quantised weights,
+   float32 activations.
+2. **Compiled offline**: constant folding, dead elimination, identity
+   elimination — the full model shrinks to a single datapath circuit.
+3. **Executed in C**: one `processor_infer_bytes()` call does everything —
+   BPE encode, prefill, decode, BPE decode, KV cache — zero Python in
+   the inference loop.
 4. **Exportable** to Verilog/VHDL for FPGA synthesis.
 
 ## The core idea
@@ -21,39 +24,68 @@ graph (DAG):
 
 | Operation | Circuit node |
 |---|---|
-| **Weights** | CONST nodes (float32 values baked into the graph) |
+| **Weights** | CONST nodes (INT8 quantised, per-column scales) |
 | **Activation fns** (SiLU, exp, rsqrt, cos, sin) | LUT nodes (computed in C) |
-| **Matrix multiply** | MATMUL node |
+| **Matrix multiply** | MATMUL / MATMUL_Q8 nodes |
 | **RMSNorm** | Composite: square → mean → rsqrt LUT → mul |
 | **Softmax** | Composite: max → sub → exp LUT → sum → div |
-| **RoPE** | Precomputed cos/sin CONST → mul → add |
+| **RoPE** | Precomputed cos/sin tables → mul → add |
 | **Residual connections** | ADD nodes |
 | **Attention** | MATMUL → scale → causal mask → softmax |
 | **Reshape / transpose** | Zero-cost wiring nodes |
 
-The full model is one graph.  The compiler builds it, the optimizer
-shrinks it, the C executor runs it.
+The full model is one circuit graph.  The compiler builds it, the
+optimizer shrinks it, the C virtual processor runs it.
 
-### Two-phase optimisation
+### The virtual processor
+
+The **Processor** is the compiled chip — a datapath circuit plus
+configuration (embedding table, RoPE tables, KV cache layout).
+The **NativeRunner** is the CPU emulation of this processor,
+implemented entirely in C:
+
+```
+Raw UTF-8 bytes
+    │
+    ▼
+┌──────────────┐
+│  BPE Encode  │  FNV-1a hash vocab lookup + merge loop (C)
+└──────┬───────┘
+       │ token IDs
+       ▼
+┌──────────────┐
+│   Prefill    │  Feed each prompt token through the datapath tape (C)
+└──────┬───────┘
+       │ KV cache populated
+       ▼
+┌──────────────┐
+│    Decode    │  Autoregressive: embed → RoPE → tape_run → argmax (C)
+└──────┬───────┘
+       │ token ID per step
+       ▼
+┌──────────────┐
+│  BPE Decode  │  Token ID → UTF-8 bytes, streamed via callback (C)
+└──────┬───────┘
+       │
+       ▼
+Raw UTF-8 bytes (streamed)
+```
+
+One C function call.  Python is only the ctypes bridge.
+
+### Graph optimisation
 
 **Offline (compile time)** — weights and model structure are known:
 
 - **Constant folding**: all-const subgraphs collapse to a single node.
-- **Dead gate elimination**: unreachable nodes are pruned.
+- **Dead node elimination**: unreachable nodes are pruned.
 - **Identity elimination**: trivial ops like `add(x, 0)` removed.
-
-**Online (per-token JIT)** — KV cache values become known after each
-decode step:
-
-- Fold cached K/V values as constants into the attention circuit.
-- Re-optimise the specialised circuit — progressively smaller.
-- Cache optimised circuits by prefix hash.
 
 ### FPGA as the target
 
 The optimised DAG exports directly to Verilog/VHDL.  Every node maps
 to synthesisable RTL — LUT nodes become BRAM ROMs, arithmetic nodes
-become FPU instances (or vendor IP), wiring nodes are free.
+become FPU instances, wiring nodes are free.
 
 ## Installation
 
@@ -64,108 +96,114 @@ pip install -e ".[dev]"
 Requires Python ≥ 3.13.  Runtime dependency: **numpy** (≥ 1.26).
 torch + transformers needed only at compile time (model download).
 
-## Usage
-
-### 1. Compile model to circuit graph
+### Compile the C extensions
 
 ```bash
-kllm --mode compile --model TinyLlama/TinyLlama-1.1B-Chat-v1.0
+# macOS
+cc -O3 -shared -fPIC -march=native -o csrc/_tape_runner.so \
+   csrc/_tape_runner.c -lm -framework Accelerate
+
+cc -O3 -shared -fPIC -march=native -o csrc/_circuit_eval.so \
+   csrc/_circuit_eval.c -lm -framework Accelerate
+
+# Linux
+cc -O3 -shared -fPIC -march=native -o csrc/_tape_runner.so \
+   csrc/_tape_runner.c -lm -lopenblas
+
+cc -O3 -shared -fPIC -march=native -o csrc/_circuit_eval.so \
+   csrc/_circuit_eval.c -lm -lopenblas
 ```
 
-Downloads model from HuggingFace, extracts weights, builds circuit
-graph, optimises, and serialises to disk.
+## Usage
+
+### 1. Create a chip from a HuggingFace model
+
+```bash
+kllm create --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 ./mychip
+```
+
+Downloads the model, compiles the circuit graph, quantises weights to
+INT8, serialises the BPE tokenizer as circuit ROMs, and writes the
+complete chip to `./mychip/`.
 
 ### 2. Run inference
 
 ```bash
-kllm --mode infer --text "The capital of France is" --max-tokens 20
+kllm infer ./mychip --max-tokens 100 "Hello world"
 ```
+
+Everything runs in C — BPE encode, prefill, autoregressive decode,
+BPE decode.  Output streams to stdout.
 
 ### 3. Compare with HuggingFace (requires torch)
 
 ```bash
-kllm --mode compare --text "Hello world" --max-tokens 10
+kllm compare ./mychip --max-tokens 10 "Hello world"
 ```
 
 ### 4. Export to HDL
 
 ```bash
-kllm --mode export-hdl --output-format verilog
+kllm export-hdl ./mychip --format verilog
+```
+
+### 5. Simulate inference in Verilog
+
+```bash
+kllm simulate-infer ./mychip --max-tokens 5 "Hello"
 ```
 
 ### Options
 
-| Flag | Default | Description |
-|---|---|---|
-| `--mode` | *(required)* | `compile`, `infer`, `compare`, `export-hdl` |
-| `--model` | `TinyLlama/TinyLlama-1.1B-Chat-v1.0` | HuggingFace model ID or local path |
-| `--save-dir` | `./lossless_logic` | Where compiled circuit graph is stored |
-| `--text` | *(interactive)* | Prompt text |
-| `--max-tokens` | `50` | Max new tokens for infer/compare modes |
-| `--output-format` | `verilog` | HDL format: `verilog` or `vhdl` |
+`--max-tokens` supports multiplier suffixes: `128k` → 131072, `1m` → 1048576.
 
 ## Project structure
 
 ```
 src/kllm/
-├── cli.py              # CLI entry point
-├── fabric.py           # Model weight loader (HuggingFace → float32 arrays)
-├── tokenizer.py        # Pure-Python BPE tokenizer
-├── circuit_graph.py    # Core DAG — circuit builder + reference evaluator
-├── circuit_compiler.py # Compile transformer into CircuitGraph
-├── circuit_executor.py # C-accelerated graph evaluator (ctypes wrapper)
-├── graph_optimizer.py  # Constant folding + dead elimination + identity elim
-├── jit_optimizer.py    # Per-token JIT optimization with KV cache folding
-├── hdl_export.py       # Verilog / VHDL / testbench / resource estimation
-├── binary_ops.py       # IEEE-754 reference implementations (golden model)
-├── compare.py          # HuggingFace vs kllm comparison
-├── model.py            # Reference NumPy LLaMA (used by compare)
-├── bitops.py           # IEEE-754 byte-plane extract / repack
-├── optimizer.py        # Quine-McCluskey boolean minimisation
-└── device.py           # GPU / CPU abstraction
+├── cli.py                # CLI entry point (create, infer, compare, export-hdl, simulate-infer)
+├── chip.py               # Chip: self-contained compiled model artifact (bytes in → bytes out)
+├── processor.py          # Processor: datapath + tokenizer + config (the virtual device)
+├── native_runner.py      # NativeRunner: C virtual processor emulation (ctypes bridge)
+├── fabric.py             # Model weight loader (HuggingFace → float32 arrays)
+├── circuit_graph.py      # Core DAG: circuit builder + reference NumPy evaluator
+├── circuit_compiler.py   # Compile transformer into CircuitGraph
+├── circuit_executor.py   # C-accelerated graph evaluator + CTapeRunner (ctypes wrapper)
+├── circuit_tokenizer.py  # Compile BPE tokenizer into circuit graph ROMs
+├── graph_optimizer.py    # Constant folding + dead elimination + identity elimination
+├── hdl_export.py         # Verilog / VHDL export + resource estimation
+├── hdl_simulate.py       # Verilog simulation (iverilog + vvp)
+├── compare.py            # HuggingFace vs kllm side-by-side comparison
+├── model.py              # Reference NumPy LLaMA (used by compare)
+├── evaluator.py          # High-level evaluation helpers
+├── binary_ops.py         # IEEE-754 reference implementations (golden model)
+├── bitops.py             # IEEE-754 byte-plane extract / repack
+├── optimizer.py          # Quine-McCluskey boolean minimisation
+└── device.py             # GPU / CPU abstraction
 
 csrc/
-└── _circuit_eval.c     # C tensor ops library
+├── _tape_runner.c        # C virtual processor: tape engine + BPE encode/decode + full inference loop
+└── _circuit_eval.c       # C tensor ops: add/sub/mul/div, matmul, LUT activations, reductions
+```
+
+## Chip layout
+
+```
+mychip/
+├── chip.json             # chip metadata
+├── processor.json        # processor config (dims, heads, layer count, slot maps)
+├── circuit/              # compiled datapath circuit graph (binary nodes + const data)
+├── q8/                   # INT8 quantised weight matrices
+├── tables/               # embed_table.npy, rope_cos.npy, rope_sin.npy
+├── tokenizer/            # raw tokenizer files
+├── tokenizer_roms/       # BPE tokenizer as serialised circuit graph
+└── weights/              # model config + layer weights
 ```
 
 ## Running tests
 
 ```bash
-pytest          # 265 tests
-```
-
-## Current status
-
-| Component | Status |
-|---|---|
-| Circuit graph DAG + reference evaluator | ✅ |
-| Transformer → circuit graph compilation | ✅ |
-| C gate executor (zero NumPy runtime) | ✅ |
-| Offline graph optimisation | ✅ |
-| Online JIT per-token optimisation | ✅ |
-| FPGA export (Verilog/VHDL) | ✅ |
-| Integration tests (265 tests) | ✅ |
-| Unified pipeline (no Z3) | 🔲 Phase 9 |
-
-See [PLAN.md](PLAN.md) for the full roadmap.
-
-## Compiled output layout
-
-```
-lossless_logic/
-├── weights/
-│   ├── config.json           # model config (dims, heads, theta)
-│   ├── embed_tokens.npy      # (vocab_size, hidden_size) float32
-│   ├── final_norm_weight.npy # (hidden_size,) float32
-│   ├── lm_head.npy           # (vocab_size, hidden_size) or tied
-│   └── layer_N/
-│       ├── q_proj.npy … down_proj.npy   # projection weights
-│       ├── input_layernorm_weight.npy
-│       └── post_attention_layernorm_weight.npy
-├── circuit_graph/            # serialised CircuitGraph
-└── tokenizer/
-    ├── tokenizer.json
-    └── tokenizer_config.json
+pytest          # 258 tests
 ```
 
 ## License

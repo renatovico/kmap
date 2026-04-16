@@ -452,9 +452,15 @@ class ExecutionPlan:
 
             elif tag == _T_MATMUL:
                 # (tag, nid, i0, i1)
-                v[instr[1]] = np.matmul(
-                    np.ascontiguousarray(v[instr[2]], dtype=np.float32),
-                    np.ascontiguousarray(v[instr[3]], dtype=np.float32))
+                a = np.ascontiguousarray(v[instr[2]], dtype=np.float32)
+                b = np.ascontiguousarray(v[instr[3]], dtype=np.float32)
+                if 0 in a.shape or 0 in b.shape:
+                    # Apple Accelerate BLAS doesn't support N=0 in sgemm.
+                    # Compute the output shape manually and return zeros.
+                    out_shape = a.shape[:-1] + b.shape[-1:]
+                    v[instr[1]] = np.zeros(out_shape, dtype=np.float32)
+                else:
+                    v[instr[1]] = np.matmul(a, b)
 
             elif tag == _T_MATMUL_Q8:
                 # (tag, nid, x_id, wq8_ptr, K, N, scales_ptr)
@@ -678,6 +684,66 @@ def _setup_tape_lib(lib: ctypes.CDLL) -> None:
         IP, IP,            # output_tokens, output_len
     ]
 
+    # BPE encode/decode
+    BP = ctypes.POINTER(ctypes.c_ubyte)
+    I32P = ctypes.POINTER(ctypes.c_int32)
+
+    lib.bpe_encode.restype = I
+    lib.bpe_encode.argtypes = [
+        BP, I,             # raw_bytes, raw_len
+        BP, I32P, I32P,    # hash_keys, hash_vals, hash_lens
+        I, I,              # table_size, max_piece_len
+        I32P, I32P, I32P, I, # merge_a, merge_b, merge_result, num_merges
+        I, I,              # bos_token_id, max_tokens
+        I32P,              # out_ids
+    ]
+
+    lib.bpe_decode.restype = I
+    lib.bpe_decode.argtypes = [
+        I32P, I,           # token_ids, num_tokens
+        BP, I32P,          # id_to_bytes, id_to_offsets
+        I,                 # vocab_size
+        I32P, I,           # special_ids, num_special
+        I,                 # max_bytes
+        BP,                # out_bytes
+    ]
+
+    # processor_infer_bytes — full bytes-in → streaming bytes-out
+    CALLBACK = ctypes.CFUNCTYPE(
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_ubyte),
+        ctypes.c_int,
+        ctypes.c_void_p,
+    )
+
+    lib.processor_infer_bytes.restype = I
+    lib.processor_infer_bytes.argtypes = [
+        VP,                # ctx
+        # BPE ROMs
+        BP, I32P, I32P,    # hash_keys, hash_vals, hash_lens
+        I, I,              # table_size, max_piece_len
+        I32P, I32P, I32P, I, # merge_a, merge_b, merge_result, num_merges
+        BP, I32P,          # id_to_bytes, id_to_offsets
+        I32P, I,           # special_ids, num_special
+        I,                 # bos_token_id
+        # Processor resources
+        FP, I, I,          # embed_table, vocab_size, hidden_dim
+        FP, FP, I,         # rope_cos, rope_sin, head_dim
+        # Slot mappings
+        I, I, I,           # token_embed_slot, rope_cos_slot, rope_sin_slot
+        IP, IP,            # kv_in_slots, kv_out_slots
+        I, I, I,           # logits_slot, n_layers, num_kv_heads
+        # Inference params
+        BP, I,             # input_bytes, input_len
+        I, I,              # max_new_tokens, eos_token_id
+        I, I,              # max_seq_tokens, max_bpe_bytes
+        # Callback
+        CALLBACK,          # token_callback_fn
+        ctypes.c_void_p,   # user_data
+        # Output
+        IP,                # total_generated
+    ]
+
 
 # C tape instruction tags (match _tape_runner.c enum)
 _CT_LUT_SILU  = 0
@@ -738,6 +804,7 @@ class _TapeInstrFields(ctypes.Structure):
         ("scales_ptr", ctypes.c_void_p),
         ("K_q8", ctypes.c_int),
         ("N_q8", ctypes.c_int),
+        ("wf32_ptr", ctypes.c_void_p),
         ("axes", ctypes.c_int * 8),
         ("starts", ctypes.c_int * 8),
         ("stops", ctypes.c_int * 8),
@@ -1223,7 +1290,11 @@ def evaluate_c(graph: CircuitGraph,
         elif node.op == Op.MATMUL:
             a = np.ascontiguousarray(inp[0], dtype=np.float32)
             b = np.ascontiguousarray(inp[1], dtype=np.float32)
-            values[nid] = np.matmul(a, b)
+            if 0 in a.shape or 0 in b.shape:
+                out_shape = a.shape[:-1] + b.shape[-1:]
+                values[nid] = np.zeros(out_shape, dtype=np.float32)
+            else:
+                values[nid] = np.matmul(a, b)
 
         elif node.op == Op.MATMUL_Q8:
             x = np.ascontiguousarray(inp[0], dtype=np.float32)

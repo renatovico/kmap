@@ -10,7 +10,7 @@ import os
 import tempfile
 
 from kllm.processor import Processor
-from kllm.native_runner import NativeRunner, clear_prefix_cache
+from kllm.native_runner import NativeRunner
 from kllm.circuit_graph import CircuitGraph, Op
 
 
@@ -111,108 +111,89 @@ class TestProcessorSaveLoad:
 
 
 class TestNativeRunner:
-    """Test NativeRunner inference loop."""
+    """Test NativeRunner (C virtual processor)."""
 
-    def test_infer_returns_token_ids(self):
+    def test_construct_without_tokenizer(self):
+        """NativeRunner can be constructed even without tokenizer ROMs."""
         fab = MockFabric(num_layers=1, hidden_size=16, num_heads=2,
                          num_kv_heads=2, intermediate_size=32, vocab_size=64)
         proc = Processor.build(fab, eos_token_id=2)
         runner = NativeRunner(proc)
 
-        # Run with a small prompt
-        output = runner.infer([0, 1, 2], max_tokens=3)
+        # No tokenizer means no BPE ROMs
+        assert runner._bpe_roms == {}
 
-        assert isinstance(output, list)
-        assert all(isinstance(t, int) for t in output)
-        assert all(0 <= t < 64 for t in output)
-
-    def test_infer_respects_max_tokens(self):
+    def test_infer_bytes_requires_tokenizer(self):
+        """infer_bytes raises RuntimeError without tokenizer ROMs."""
         fab = MockFabric(num_layers=1, hidden_size=16, num_heads=2,
                          num_kv_heads=2, intermediate_size=32, vocab_size=64)
         proc = Processor.build(fab, eos_token_id=2)
         runner = NativeRunner(proc)
 
-        output = runner.infer([0, 1], max_tokens=5)
-        assert len(output) <= 5
+        with pytest.raises(RuntimeError, match="No BPE ROMs"):
+            runner.infer_bytes(b"Hello", max_tokens=1)
 
-    def test_infer_empty_prompt(self):
+    def test_infer_bytes_empty_input(self):
+        """Empty input returns empty bytes."""
         fab = MockFabric(num_layers=1, hidden_size=16, num_heads=2,
                          num_kv_heads=2, intermediate_size=32, vocab_size=64)
         proc = Processor.build(fab, eos_token_id=2)
         runner = NativeRunner(proc)
 
-        output = runner.infer([], max_tokens=3)
-        assert output == []
+        result = runner.infer_bytes(b"", max_tokens=5)
+        assert result == b""
 
-    def test_infer_single_token_prompt(self):
-        fab = MockFabric(num_layers=1, hidden_size=16, num_heads=2,
-                         num_kv_heads=2, intermediate_size=32, vocab_size=64)
-        proc = Processor.build(fab, eos_token_id=2)
-        runner = NativeRunner(proc)
 
-        output = runner.infer([5], max_tokens=3)
-        assert isinstance(output, list)
-        assert len(output) <= 3
+MYCHIP_PATH = os.path.join(os.path.dirname(__file__), "..", "mychip")
 
-    def test_infer_streaming_matches_batch(self):
-        fab = MockFabric(num_layers=1, hidden_size=16, num_heads=2,
-                         num_kv_heads=2, intermediate_size=32, vocab_size=64)
-        proc = Processor.build(fab, eos_token_id=2)
 
-        batch_runner = NativeRunner(proc)
-        batch_output = batch_runner.infer([0, 1, 2], max_tokens=5)
+@pytest.mark.skipif(
+    not os.path.isdir(MYCHIP_PATH),
+    reason="mychip directory not found (integration test)"
+)
+class TestNativeRunnerIntegration:
+    """Integration tests using a real compiled chip."""
 
-        stream_runner = NativeRunner(proc)
-        stream_output = list(stream_runner.infer_streaming([0, 1, 2], max_tokens=5))
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        proc = Processor.load(MYCHIP_PATH)
+        self.runner = NativeRunner(proc)
 
-        assert batch_output == stream_output
+    def test_infer_bytes_returns_bytes(self):
+        result = self.runner.infer_bytes(b"Hello", max_tokens=3)
+        assert isinstance(result, bytes)
+        assert len(result) > 0
 
-    def test_infer_deterministic(self):
-        """Same prompt + same processor → same output (greedy decode)."""
-        fab = MockFabric(num_layers=1, hidden_size=16, num_heads=2,
-                         num_kv_heads=2, intermediate_size=32, vocab_size=64)
-        proc = Processor.build(fab, eos_token_id=2)
+    def test_infer_bytes_streaming_yields_chunks(self):
+        chunks = list(self.runner.infer_bytes_streaming(b"Hello", 3))
+        assert len(chunks) > 0
+        assert all(isinstance(c, bytes) for c in chunks)
 
-        runner1 = NativeRunner(proc)
-        output1 = runner1.infer([0, 1, 2], max_tokens=5)
+        # Streaming result matches batch result
+        batch = self.runner.infer_bytes(b"Hello", max_tokens=3)
+        assert b"".join(chunks) == batch
 
-        runner2 = NativeRunner(proc)
-        output2 = runner2.infer([0, 1, 2], max_tokens=5)
+    def test_infer_bytes_deterministic(self):
+        """Same input → same output (greedy decode)."""
+        proc = Processor.load(MYCHIP_PATH)
+        r1 = NativeRunner(proc)
+        out1 = r1.infer_bytes(b"Hello world", max_tokens=3)
 
-        assert output1 == output2
+        r2 = NativeRunner(proc)
+        out2 = r2.infer_bytes(b"Hello world", max_tokens=3)
 
-    def test_c_infer_matches_python_fallback(self):
-        """C processor_infer() must produce same tokens as Python loop."""
-        fab = MockFabric(num_layers=1, hidden_size=16, num_heads=2,
-                         num_kv_heads=2, intermediate_size=32, vocab_size=64)
-        proc = Processor.build(fab, eos_token_id=2)
-
-        # Force Python path
-        py_runner = NativeRunner(proc)
-        py_runner._c_infer_available = False
-        py_output = py_runner._infer_python([0, 1, 2], max_tokens=5)
-
-        # Use default path (C if available)
-        c_runner = NativeRunner(proc)
-        c_output = c_runner.infer([0, 1, 2], max_tokens=5)
-
-        assert py_output == c_output, (
-            f"C inference {c_output} != Python inference {py_output}")
+        assert out1 == out2
 
     def test_save_load_then_infer_matches(self):
         """Inference after save/load must match original."""
-        fab = MockFabric(num_layers=1, hidden_size=16, num_heads=2,
-                         num_kv_heads=2, intermediate_size=32, vocab_size=64)
-        proc = Processor.build(fab, eos_token_id=2)
-
+        proc = Processor.load(MYCHIP_PATH)
         runner1 = NativeRunner(proc)
-        output1 = runner1.infer([0, 1, 2], max_tokens=3)
+        output1 = runner1.infer_bytes(b"Hello", max_tokens=3)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             proc.save(tmpdir)
             loaded = Processor.load(tmpdir)
-
             runner2 = NativeRunner(loaded)
-            output2 = runner2.infer([0, 1, 2], max_tokens=3)
+            output2 = runner2.infer_bytes(b"Hello", max_tokens=3)
 
         assert output1 == output2

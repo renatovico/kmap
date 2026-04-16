@@ -42,10 +42,8 @@ import numpy as np
 from kllm.circuit_compiler import (
     DecodeMachine,
     compile_decode_template,
-    compile_model,
     _build_rope_const,
 )
-from kllm.circuit_executor import evaluate_c
 from kllm.circuit_graph import CircuitGraph
 from kllm.circuit_tokenizer import (
     compile_tokenizer_graph_from_json,

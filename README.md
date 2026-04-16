@@ -174,12 +174,7 @@ src/kllm/
 ├── hdl_export.py         # Verilog / VHDL export + resource estimation
 ├── hdl_simulate.py       # Verilog simulation (iverilog + vvp)
 ├── compare.py            # HuggingFace vs kllm side-by-side comparison
-├── model.py              # Reference NumPy LLaMA (used by compare)
-├── evaluator.py          # High-level evaluation helpers
-├── binary_ops.py         # IEEE-754 reference implementations (golden model)
-├── bitops.py             # IEEE-754 byte-plane extract / repack
-├── optimizer.py          # Quine-McCluskey boolean minimisation
-└── device.py             # GPU / CPU abstraction
+└── evaluator.py          # High-level evaluation helpers
 
 csrc/
 ├── _tape_runner.c        # C virtual processor: tape engine + BPE encode/decode + full inference loop

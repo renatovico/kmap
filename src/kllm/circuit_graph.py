@@ -9,10 +9,9 @@ the circuit.  It can be:
 3. **Optimised** (constant folding, dead elimination, gate merge) — Phase 5.
 4. **Synthesised** to Verilog/VHDL for FPGA — Phase 7.
 
-The Python IEEE-754 bit-manipulation that was in ``binary_ops.py`` does
-NOT belong here — execution is the **executor's** responsibility,
-not the graph's.  The graph defines WHAT to compute; the executor
-defines HOW.
+IEEE-754 bit-manipulation does NOT belong here — execution is the
+**executor's** responsibility, not the graph's.  The graph defines
+WHAT to compute; the executor defines HOW.
 
 Node kinds
 ----------

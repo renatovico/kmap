@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from kllm.circuit_graph import CircuitGraph, Op
-from kllm.evaluator import evaluate, register_lut
+from kllm.evaluator import evaluate
 
 
 # ---------------------------------------------------------------
@@ -18,12 +18,6 @@ from kllm.evaluator import evaluate, register_lut
 
 def _rand32(shape, rng):
     return rng.standard_normal(shape).astype(np.float32)
-
-
-def _eval_single(graph, inputs=None):
-    """Evaluate graph, return the last node's value."""
-    vals = evaluate(graph, inputs)
-    return vals[len(graph) - 1]
 
 
 # ---------------------------------------------------------------

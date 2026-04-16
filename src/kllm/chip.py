@@ -157,11 +157,6 @@ class Chip:
         processor = Processor.load(chip_path)
         return cls(path=chip_path, processor=processor)
 
-    @staticmethod
-    def exists(chip_path: str) -> bool:
-        """Check whether a compiled chip exists at the given path."""
-        return os.path.exists(os.path.join(chip_path, "chip.json"))
-
     def _get_runner(self) -> NativeRunner:
         """Lazy-init the native runner (the virtual device)."""
         if self._runner is None:

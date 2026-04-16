@@ -150,13 +150,6 @@ def _compile_vocab_hash(
     return {"keys": keys, "vals": vals, "lens": lens}
 
 
-def save_roms(roms: dict[str, np.ndarray], directory: str) -> None:
-    """Save compiled ROM arrays to disk."""
-    os.makedirs(directory, exist_ok=True)
-    for name, arr in roms.items():
-        np.save(os.path.join(directory, f"{name}.npy"), arr)
-
-
 def load_roms(directory: str) -> dict[str, np.ndarray]:
     """Load previously compiled ROM arrays from disk."""
     roms = {}

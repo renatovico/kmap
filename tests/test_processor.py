@@ -9,7 +9,8 @@ import pytest
 import os
 import tempfile
 
-from kllm.processor import Processor, NativeRunner, clear_prefix_cache
+from kllm.processor import Processor
+from kllm.native_runner import NativeRunner, clear_prefix_cache
 from kllm.circuit_graph import CircuitGraph, Op
 
 

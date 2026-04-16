@@ -1,21 +1,34 @@
 """Profile per-op-type time in evaluate_c."""
+import json
 import time
 import numpy as np
 from collections import defaultdict
 
 from kllm.fabric import Fabric
-from kllm.processor import Processor, NativeRunner
-from kllm.tokenizer import Tokenizer
+from kllm.processor import Processor
+from kllm.native_runner import NativeRunner
 from kllm.circuit_executor import ExecutionPlan, precompute_consts, _get_lib, _LUT_FN_MAP, _to_c_float
 from kllm.circuit_graph import Op
 
 fabric = Fabric("./lossless_logic")
-tok = Tokenizer("./lossless_logic/tokenizer")
-prompt = tok.encode("<|user|>\nHello<|assistant|>\n")
+
+# Read EOS token ID from tokenizer config
+tok_dir = "./lossless_logic/tokenizer"
+with open(f"{tok_dir}/tokenizer_config.json") as f:
+    eos_token_id = json.load(f).get("eos_token", "</s>")
+with open(f"{tok_dir}/tokenizer.json") as f:
+    vocab = json.load(f)["model"]["vocab"]
+eos_token_id = vocab.get(eos_token_id, 2)
 
 # Build processor and runner
-proc = Processor.build(fabric, tok.eos_token_id)
+proc = Processor.build(fabric, eos_token_id, tokenizer_dir=tok_dir)
 runner = NativeRunner(proc)
+
+# Encode prompt via circuit tokenizer
+prompt_text = "<|user|>\nHello<|assistant|>\n"
+prompt_bytes = prompt_text.encode("utf-8")
+token_ids_arr, num_tokens = runner.encode_bytes(prompt_bytes)
+prompt = token_ids_arr[:num_tokens].tolist()
 
 # Warm up: prefill + 5 decode steps to reach steady state
 output = runner._infer_python(prompt, max_tokens=5)

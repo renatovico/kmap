@@ -246,6 +246,8 @@ _T_SLICE = 14
 _T_CAST = 15
 _T_EXPAND_DIMS = 16
 _T_MATMUL_Q8 = 17
+_T_BPE_ENCODE = 18
+_T_BPE_DECODE = 19
 
 _BINOP_FN = {
     Op.ADD: np.add,
@@ -418,6 +420,11 @@ class ExecutionPlan:
                 tape.append((_T_EXPAND_DIMS, nid, ins[0],
                              node.params["axis"]))
 
+            elif node.op in (Op.BPE_ENCODE, Op.BPE_DECODE):
+                # BPE ops carry their own params — store the node ref
+                tag = _T_BPE_ENCODE if node.op == Op.BPE_ENCODE else _T_BPE_DECODE
+                tape.append((tag, nid, ins, node))
+
             else:
                 raise ValueError(f"Unknown op: {node.op}")
 
@@ -549,6 +556,16 @@ class ExecutionPlan:
             elif tag == _T_CAST:
                 # (tag, nid, i0, dtype)
                 v[instr[1]] = np.asarray(v[instr[2]]).astype(instr[3])
+
+            elif tag in (_T_BPE_ENCODE, _T_BPE_DECODE):
+                # (tag, nid, input_nids_tuple, node)
+                from kllm.evaluator import _eval_bpe_encode, _eval_bpe_decode
+                inp_vals = [v[i] for i in instr[2]]
+                node = instr[3]
+                if tag == _T_BPE_ENCODE:
+                    v[instr[1]] = _eval_bpe_encode(node, inp_vals, v)
+                else:
+                    v[instr[1]] = _eval_bpe_decode(node, inp_vals, v)
 
         return v
 
@@ -962,6 +979,17 @@ class CTapeRunner:
                 shapes[nid] = shapes[ins[0]]
                 instrs.append((_CT_COPY, nid, p))
 
+            elif node.op in (Op.BPE_ENCODE, Op.BPE_DECODE):
+                # BPE ops use the node's declared shape
+                out_s = node.shape or (1,)
+                shapes[nid] = out_s
+                # Store the node and input nids for Python-side execution
+                p["_bpe_node"] = node
+                p["_bpe_inputs"] = ins
+                instrs.append((_CT_COPY, nid, p))
+                # Mark as needing Python fallback
+                p["_bpe_fallback"] = True
+
             else:
                 raise ValueError(f"CTapeRunner: unknown op {node.op}")
 
@@ -1265,6 +1293,15 @@ def evaluate_c(graph: CircuitGraph,
         elif node.op == Op.EXPAND_DIMS:
             values[nid] = np.expand_dims(
                 np.ascontiguousarray(inp[0]), axis=node.params["axis"])
+
+        elif node.op in (Op.BPE_ENCODE, Op.BPE_DECODE):
+            # Delegate to the reference evaluator for BPE ops —
+            # these are FSM-driven ROM lookups, not tensor math.
+            from kllm.evaluator import _eval_bpe_encode, _eval_bpe_decode
+            if node.op == Op.BPE_ENCODE:
+                values[nid] = _eval_bpe_encode(node, inp, values)
+            else:
+                values[nid] = _eval_bpe_decode(node, inp, values)
 
         else:
             raise ValueError(f"Unknown op: {node.op}")

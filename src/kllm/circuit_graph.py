@@ -39,6 +39,8 @@ Node kinds
 - ``repeat``   : wire fanout (zero gates)
 - ``slice``    : wire select (zero gates)
 - ``sqrt``     : via rsqrt LUT (or Newton-Raphson circuit)
+- ``bpe_encode``: ROM-based BPE tokenizer (UTF-8 bytes → token IDs)
+- ``bpe_decode``: ROM-based BPE detokenizer (token IDs → UTF-8 bytes)
 """
 
 from __future__ import annotations
@@ -93,6 +95,10 @@ class Op(str, Enum):
     # Cast / view
     CAST        = "cast"
     EXPAND_DIMS = "expand_dims"
+
+    # Tokenizer (ROM-backed FSM)
+    BPE_ENCODE  = "bpe_encode"   # UTF-8 bytes → token IDs
+    BPE_DECODE  = "bpe_decode"   # token IDs → UTF-8 bytes
 
 
 @dataclass
@@ -266,6 +272,100 @@ class CircuitGraph:
         return self._add_node(Op.CAST, [x], {"dtype": dtype},
                               dtype=dtype, name=name)
 
+    # ---- Tokenizer (ROM-backed FSM) -----------------------------
+
+    def bpe_encode(
+        self,
+        byte_input: int,
+        byte_length: int,
+        vocab_hash_keys: int,
+        vocab_hash_vals: int,
+        vocab_hash_lens: int,
+        merge_a: int,
+        merge_b: int,
+        merge_result: int,
+        special_ids: int,
+        bos_token_id: int = 1,
+        max_tokens: int = 2048,
+        name: str = "",
+    ) -> tuple[int, int]:
+        """BPE encode: UTF-8 bytes → token IDs.
+
+        Inputs:
+          byte_input     — INPUT uint8[max_bytes], raw UTF-8
+          byte_length    — INPUT int32 scalar, actual byte count
+          vocab_hash_*   — CONST ROMs for piece→token_id lookup
+          merge_a/b/result — CONST merge-priority ROM
+          special_ids    — CONST int32 array of special token IDs
+
+        Returns (token_ids_node, num_tokens_node):
+          token_ids  — int32[max_tokens], padded with 0
+          num_tokens — int32 scalar, actual count
+        """
+        token_ids = self._add_node(
+            Op.BPE_ENCODE,
+            [byte_input, byte_length, vocab_hash_keys, vocab_hash_vals,
+             vocab_hash_lens, merge_a, merge_b, merge_result, special_ids],
+            {"bos_token_id": bos_token_id, "max_tokens": max_tokens,
+             "output_index": 0},
+            shape=(max_tokens,),
+            dtype=np.dtype(np.int32),
+            name=f"{name}/token_ids" if name else "bpe_enc/token_ids",
+        )
+        num_tokens = self._add_node(
+            Op.BPE_ENCODE,
+            [byte_input, byte_length, vocab_hash_keys, vocab_hash_vals,
+             vocab_hash_lens, merge_a, merge_b, merge_result, special_ids],
+            {"bos_token_id": bos_token_id, "max_tokens": max_tokens,
+             "output_index": 1, "paired_node": token_ids},
+            shape=(1,),
+            dtype=np.dtype(np.int32),
+            name=f"{name}/num_tokens" if name else "bpe_enc/num_tokens",
+        )
+        return token_ids, num_tokens
+
+    def bpe_decode(
+        self,
+        token_ids: int,
+        num_tokens: int,
+        id_to_bytes: int,
+        id_to_offsets: int,
+        special_ids: int,
+        max_bytes: int = 8192,
+        name: str = "",
+    ) -> tuple[int, int]:
+        """BPE decode: token IDs → UTF-8 bytes.
+
+        Inputs:
+          token_ids     — int32[max_tokens]
+          num_tokens    — int32 scalar
+          id_to_bytes   — CONST uint8 ROM (concatenated token strings)
+          id_to_offsets — CONST int32[vocab_size, 2] (offset, length)
+          special_ids   — CONST int32 array of special token IDs
+
+        Returns (byte_output_node, byte_length_node):
+          byte_output — uint8[max_bytes], padded with 0
+          byte_length — int32 scalar, actual count
+        """
+        byte_output = self._add_node(
+            Op.BPE_DECODE,
+            [token_ids, num_tokens, id_to_bytes, id_to_offsets, special_ids],
+            {"max_bytes": max_bytes, "output_index": 0},
+            shape=(max_bytes,),
+            dtype=np.dtype(np.uint8),
+            name=f"{name}/byte_output" if name else "bpe_dec/byte_output",
+        )
+        byte_length = self._add_node(
+            Op.BPE_DECODE,
+            [token_ids, num_tokens, id_to_bytes, id_to_offsets, special_ids],
+            {"max_bytes": max_bytes, "output_index": 1,
+             "paired_node": byte_output},
+            shape=(1,),
+            dtype=np.dtype(np.int32),
+            name=f"{name}/byte_length" if name else "bpe_dec/byte_length",
+        )
+        return byte_output, byte_length
+
     # ---- Composite subgraphs ------------------------------------
 
     def softmax(self, x: int, axis: int = -1, name: str = "") -> int:
@@ -328,6 +428,7 @@ class CircuitGraph:
         zero_gate_ops = {Op.RESHAPE, Op.TRANSPOSE, Op.CONCAT,
                          Op.REPEAT, Op.SLICE, Op.CONST, Op.INPUT, Op.CAST,
                          Op.EXPAND_DIMS}
+        # BPE ops are FSM-driven ROM lookups — they have gate logic
         counts: dict[str, int] = {"total": 0, "wire": 0, "gate": 0}
         for n in self.nodes:
             counts[n.op.value] = counts.get(n.op.value, 0) + 1

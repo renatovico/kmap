@@ -11,6 +11,8 @@ validation.  The C executor will use byte-plane gates instead.
 
 from __future__ import annotations
 
+import re
+
 import numpy as np
 
 from kllm.circuit_graph import CircuitGraph, Op
@@ -193,7 +195,296 @@ def evaluate(graph: CircuitGraph,
         elif node.op == Op.EXPAND_DIMS:
             values[nid] = np.expand_dims(inp[0], axis=node.params["axis"])
 
+        elif node.op == Op.BPE_ENCODE:
+            values[nid] = _eval_bpe_encode(node, inp, values)
+
+        elif node.op == Op.BPE_DECODE:
+            values[nid] = _eval_bpe_decode(node, inp, values)
+
         else:
             raise ValueError(f"Unknown op: {node.op}")
 
     return values
+
+
+# ------------------------------------------------------------------
+# BPE reference implementation (ROM-based, matches hardware FSM)
+# ------------------------------------------------------------------
+
+_META = "▁"
+_META_BYTES = _META.encode("utf-8")  # 0xE2 0x96 0x81
+
+
+def _vocab_hash_lookup(
+    piece_bytes: bytes,
+    hash_keys: np.ndarray,
+    hash_vals: np.ndarray,
+    hash_lens: np.ndarray,
+) -> int:
+    """Look up a piece in the vocab hash ROM.
+
+    Open-addressing hash table: hash_keys is uint8[table_size, max_piece_len],
+    hash_vals is int32[table_size], hash_lens is int32[table_size].
+    Returns token ID or -1 if not found.
+    """
+    table_size = len(hash_vals)
+    if table_size == 0:
+        return -1
+    # FNV-1a hash
+    h = 2166136261
+    for b in piece_bytes:
+        h ^= b
+        h = (h * 16777619) & 0xFFFFFFFF
+    idx = int(h % table_size)
+    for _ in range(table_size):
+        stored_len = int(hash_lens[idx])
+        if stored_len == 0:
+            return -1  # empty slot
+        if stored_len == len(piece_bytes):
+            if bytes(hash_keys[idx, :stored_len]) == piece_bytes:
+                return int(hash_vals[idx])
+        idx = (idx + 1) % table_size
+    return -1
+
+
+def _pre_tokenize_bytes(raw: bytes) -> list[bytes]:
+    """Metaspace pre-tokenization on raw UTF-8 bytes.
+
+    Adds ▁ prefix, replaces spaces with ▁, splits into words
+    where each word starts with ▁.
+    """
+    if not raw:
+        return []
+    # Add prefix space then replace spaces with metaspace
+    text = " " + raw.decode("utf-8", errors="replace")
+    text = text.replace(" ", _META)
+    if not text:
+        return []
+    # Split before ▁ only when preceded by a non-▁ character
+    r = re.escape(_META)
+    words = re.split(f"(?<=[^{r}])(?={r})", text)
+    return [w.encode("utf-8") for w in words if w]
+
+
+def _bpe_merge_loop(
+    token_ids: list[int],
+    merge_a: np.ndarray,
+    merge_b: np.ndarray,
+    merge_result: np.ndarray,
+) -> list[int]:
+    """Apply BPE merges using the merge-priority ROM.
+
+    Iteratively finds the highest-priority (lowest-rank) merge pair
+    in the current token sequence and merges all occurrences.
+    """
+    num_merges = len(merge_a)
+
+    # Build a reverse lookup: (left_id, right_id) → (rank, result_id)
+    merge_lookup: dict[tuple[int, int], tuple[int, int]] = {}
+    for rank in range(num_merges):
+        key = (int(merge_a[rank]), int(merge_b[rank]))
+        if key not in merge_lookup:  # keep lowest rank
+            merge_lookup[key] = (rank, int(merge_result[rank]))
+
+    while len(token_ids) > 1:
+        # Find the pair with lowest merge rank
+        best_rank = num_merges
+        best_pair = None
+        best_result = -1
+        for i in range(len(token_ids) - 1):
+            pair = (token_ids[i], token_ids[i + 1])
+            entry = merge_lookup.get(pair)
+            if entry is not None and entry[0] < best_rank:
+                best_rank = entry[0]
+                best_pair = pair
+                best_result = entry[1]
+
+        if best_pair is None:
+            break
+
+        # Merge all occurrences of the best pair
+        new_ids: list[int] = []
+        i = 0
+        while i < len(token_ids):
+            if (i < len(token_ids) - 1
+                    and token_ids[i] == best_pair[0]
+                    and token_ids[i + 1] == best_pair[1]):
+                new_ids.append(best_result)
+                i += 2
+            else:
+                new_ids.append(token_ids[i])
+                i += 1
+        token_ids = new_ids
+
+    return token_ids
+
+
+def _ref_bpe_encode(
+    raw_bytes: bytes,
+    byte_length: int,
+    hash_keys: np.ndarray,
+    hash_vals: np.ndarray,
+    hash_lens: np.ndarray,
+    merge_a: np.ndarray,
+    merge_b: np.ndarray,
+    merge_result: np.ndarray,
+    special_ids: np.ndarray,
+    bos_token_id: int,
+    max_tokens: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Reference BPE encode: UTF-8 bytes → token IDs.
+
+    Returns (token_ids[max_tokens], num_tokens[1]) as int32 arrays.
+    """
+    actual_bytes = raw_bytes[:byte_length]
+
+    # Pre-tokenize into words
+    words = _pre_tokenize_bytes(actual_bytes)
+
+    all_ids: list[int] = [bos_token_id]
+
+    for word_bytes in words:
+        # Split word into characters, look up each in vocab
+        text = word_bytes.decode("utf-8", errors="replace")
+        char_ids: list[int] = []
+        for ch in text:
+            ch_bytes = ch.encode("utf-8")
+            tid = _vocab_hash_lookup(ch_bytes, hash_keys, hash_vals, hash_lens)
+            if tid >= 0:
+                char_ids.append(tid)
+            else:
+                # Byte-fallback: <0xHH> tokens
+                for b in ch_bytes:
+                    tok_str = f"<0x{b:02X}>"
+                    tok_bytes = tok_str.encode("utf-8")
+                    fallback_id = _vocab_hash_lookup(
+                        tok_bytes, hash_keys, hash_vals, hash_lens)
+                    if fallback_id >= 0:
+                        char_ids.append(fallback_id)
+                    # else: drop (unknown byte, shouldn't happen)
+
+        # Apply BPE merges
+        merged = _bpe_merge_loop(char_ids, merge_a, merge_b, merge_result)
+        all_ids.extend(merged)
+
+    # Pad and return
+    n = min(len(all_ids), max_tokens)
+    token_ids = np.zeros(max_tokens, dtype=np.int32)
+    token_ids[:n] = all_ids[:n]
+    num_tokens = np.array([n], dtype=np.int32)
+    return token_ids, num_tokens
+
+
+def _ref_bpe_decode(
+    token_ids: np.ndarray,
+    num_tokens: int,
+    id_to_bytes: np.ndarray,
+    id_to_offsets: np.ndarray,
+    special_ids: np.ndarray,
+    max_bytes: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Reference BPE decode: token IDs → UTF-8 bytes.
+
+    Returns (byte_output[max_bytes], byte_length[1]).
+    """
+    special_set = set(int(x) for x in special_ids)
+    meta = _META
+
+    pieces: list[str] = []
+    for i in range(num_tokens):
+        tid = int(token_ids[i])
+        if tid in special_set:
+            continue
+        vocab_size = id_to_offsets.shape[0]
+        if tid < 0 or tid >= vocab_size:
+            continue
+        offset = int(id_to_offsets[tid, 0])
+        length = int(id_to_offsets[tid, 1])
+        if length == 0:
+            continue
+        tok_bytes = bytes(id_to_bytes[offset:offset + length])
+        pieces.append(tok_bytes.decode("utf-8", errors="replace"))
+
+    text = "".join(pieces)
+
+    # Byte-fallback decoding: <0xHH> sequences → actual bytes
+    byte_pattern = re.compile(r"(<0x[0-9A-Fa-f]{2}>)+")
+    def _decode_bytes(match):
+        hex_tokens = re.findall(r"<0x([0-9A-Fa-f]{2})>", match.group())
+        return bytes(int(h, 16) for h in hex_tokens).decode(
+            "utf-8", errors="replace")
+    text = byte_pattern.sub(_decode_bytes, text)
+
+    # Undo metaspace
+    text = text.replace(meta, " ")
+    if text.startswith(" "):
+        text = text[1:]
+
+    result_bytes = text.encode("utf-8")
+    n = min(len(result_bytes), max_bytes)
+    byte_output = np.zeros(max_bytes, dtype=np.uint8)
+    byte_output[:n] = list(result_bytes[:n])
+    byte_length = np.array([n], dtype=np.int32)
+    return byte_output, byte_length
+
+
+def _eval_bpe_encode(node, inp, values):
+    """Evaluate a BPE_ENCODE node."""
+    # inp: [byte_input, byte_length, hash_keys, hash_vals, hash_lens,
+    #       merge_a, merge_b, merge_result, special_ids]
+    byte_input = np.asarray(inp[0], dtype=np.uint8)
+    byte_length = int(np.asarray(inp[1]).flat[0])
+    hash_keys = np.asarray(inp[2], dtype=np.uint8)
+    hash_vals = np.asarray(inp[3], dtype=np.int32)
+    hash_lens = np.asarray(inp[4], dtype=np.int32)
+    merge_a = np.asarray(inp[5], dtype=np.int32)
+    merge_b = np.asarray(inp[6], dtype=np.int32)
+    merge_result = np.asarray(inp[7], dtype=np.int32)
+    special_ids = np.asarray(inp[8], dtype=np.int32)
+
+    bos_token_id = node.params.get("bos_token_id", 1)
+    max_tokens = node.params.get("max_tokens", 2048)
+    output_index = node.params.get("output_index", 0)
+
+    # Check if we already computed the paired node
+    paired = node.params.get("paired_node")
+    if paired is not None and paired in values:
+        # The paired node already computed both outputs — reuse
+        pass
+
+    raw = bytes(byte_input[:byte_length])
+    token_ids, num_tokens = _ref_bpe_encode(
+        raw, byte_length,
+        hash_keys, hash_vals, hash_lens,
+        merge_a, merge_b, merge_result, special_ids,
+        bos_token_id, max_tokens,
+    )
+
+    if output_index == 0:
+        return token_ids
+    else:
+        return num_tokens
+
+
+def _eval_bpe_decode(node, inp, values):
+    """Evaluate a BPE_DECODE node."""
+    # inp: [token_ids, num_tokens, id_to_bytes, id_to_offsets, special_ids]
+    token_ids = np.asarray(inp[0], dtype=np.int32)
+    num_tokens = int(np.asarray(inp[1]).flat[0])
+    id_to_bytes_rom = np.asarray(inp[2], dtype=np.uint8)
+    id_to_offsets = np.asarray(inp[3], dtype=np.int32)
+    special_ids = np.asarray(inp[4], dtype=np.int32)
+
+    max_bytes = node.params.get("max_bytes", 8192)
+    output_index = node.params.get("output_index", 0)
+
+    byte_output, byte_length = _ref_bpe_decode(
+        token_ids, num_tokens,
+        id_to_bytes_rom, id_to_offsets, special_ids,
+        max_bytes,
+    )
+
+    if output_index == 0:
+        return byte_output
+    else:
+        return byte_length

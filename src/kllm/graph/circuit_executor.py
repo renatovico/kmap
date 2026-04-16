@@ -726,7 +726,7 @@ def _setup_tape_lib(lib: ctypes.CDLL) -> None:
         BP, I32P,          # id_to_bytes, id_to_offsets
         I32P, I,           # special_ids, num_special
         I,                 # bos_token_id
-        # Processor resources
+        # Machine resources
         FP, I, I,          # embed_table, vocab_size, hidden_dim
         FP, FP, I,         # rope_cos, rope_sin, head_dim
         # Slot mappings

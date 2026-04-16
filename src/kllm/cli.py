@@ -7,6 +7,7 @@ Usage
   kllm compare ./mychip
   kllm export-hdl ./mychip
   kllm simulate-infer ./mychip --max-tokens 5 Hello
+  kllm profile ./mychip --max-tokens 10
 """
 
 import argparse
@@ -126,7 +127,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # ---- export-hdl ----
     export_p = sub.add_parser(
         "export-hdl",
-        help="Export the chip's processor to Verilog/VHDL.",
+        help="Export the chip's machine to Verilog/VHDL.",
     )
     export_p.add_argument(
         "chip_path",
@@ -161,6 +162,28 @@ def _build_parser() -> argparse.ArgumentParser:
         "prompt",
         nargs="*",
         help="Prompt text. Omit to enter interactively.",
+    )
+
+    # ---- profile ----
+    prof_p = sub.add_parser(
+        "profile",
+        help="Profile inference timing (load, init, infer).",
+    )
+    prof_p.add_argument(
+        "chip_path",
+        type=str,
+        help="Path to a compiled chip directory.",
+    )
+    prof_p.add_argument(
+        "--max-tokens",
+        type=_parse_token_count,
+        default=10,
+        help="Max new tokens to generate during profiling. Default: 10.",
+    )
+    prof_p.add_argument(
+        "prompt",
+        nargs="*",
+        help="Prompt text. Omit to use default.",
     )
 
     return p
@@ -211,7 +234,7 @@ def _cmd_export_hdl(args) -> None:
     )
 
     chip = Chip.load(args.chip_path)
-    proc = chip.processor
+    proc = chip.machine
 
     hdl_dir = os.path.join(args.chip_path, "hdl")
     os.makedirs(hdl_dir, exist_ok=True)
@@ -245,12 +268,47 @@ def _cmd_simulate_infer(args) -> None:
     print(f"[simulate-infer] Native output: {native_output!r}")
 
     # TODO: Phase 4 — full HDL simulation pipeline
-    # 1. export_processor_verilog(chip.processor, work_dir)
-    # 2. export_processor_testbench(chip.processor, prompt_tokens, max_tokens)
+    # 1. export_machine_verilog(chip.machine, work_dir)
+    # 2. export_machine_testbench(chip.machine, prompt_tokens, max_tokens)
     # 3. iverilog compile + vvp simulate
     # 4. Compare simulation output vs golden reference
     print("[simulate-infer] HDL simulation not yet implemented — "
           "native reference generated successfully.")
+
+
+def _cmd_profile(args) -> None:
+    import time
+    from kllm.device.chip import Chip
+
+    prompt = " ".join(args.prompt) if args.prompt else "Hello world"
+
+    print(f"[profile] Chip: {args.chip_path}")
+    print(f"[profile] Prompt: {prompt!r}")
+    print(f"[profile] Max tokens: {args.max_tokens}")
+    print()
+
+    # 1. Load machine from disk
+    t0 = time.perf_counter()
+    chip = Chip.load(args.chip_path)
+    t_load = time.perf_counter() - t0
+    print(f"  Machine load:       {t_load:.3f}s")
+
+    # 2. Init virtual device (lazy — triggered by first infer call)
+    t0 = time.perf_counter()
+    _ = chip._get_runner()
+    t_init = time.perf_counter() - t0
+    print(f"  VirtualDevice init: {t_init:.3f}s")
+
+    # 3. Inference (prefill + decode)
+    t0 = time.perf_counter()
+    output = chip.infer(prompt, args.max_tokens)
+    t_infer = time.perf_counter() - t0
+
+    n_tokens = args.max_tokens  # approximate
+    tok_per_sec = n_tokens / t_infer if t_infer > 0 else 0
+    print(f"  Inference:          {t_infer:.3f}s  ({tok_per_sec:.1f} tok/s)")
+    print()
+    print(f"  Output: {output!r}")
 
 
 # ---------------------------------------------------------------
@@ -263,6 +321,7 @@ _COMMANDS = {
     "compare": _cmd_compare,
     "export-hdl": _cmd_export_hdl,
     "simulate-infer": _cmd_simulate_infer,
+    "profile": _cmd_profile,
 }
 
 

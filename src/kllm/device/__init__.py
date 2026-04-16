@@ -1,1 +1,1 @@
-"""Device subpackage — assembled chip, processor, and native runtime."""
+"""Device subpackage — chip, machine definition, and virtual device."""

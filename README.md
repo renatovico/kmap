@@ -1,10 +1,10 @@
 # kllm
 
-**Compile a transformer into a circuit.  Optimise it.  Run it on a virtual processor.**
+**Compile a transformer into a circuit.  Optimise it.  Run it on a virtual device.**
 
 kllm turns every operation in an LLM — weights, activations, matmul,
 normalization, softmax, attention — into a **circuit graph** (DAG of
-gate nodes) and runs it on a virtual processor emulated entirely in C.
+gate nodes) and runs it on a virtual device emulated entirely in C.
 
 1. **Bit-exact** to HuggingFace output — INT8 quantised weights,
    float32 activations.
@@ -35,13 +35,13 @@ graph (DAG):
 | **Reshape / transpose** | Zero-cost wiring nodes |
 
 The full model is one circuit graph.  The compiler builds it, the
-optimizer shrinks it, the C virtual processor runs it.
+optimizer shrinks it, the virtual device runs it.
 
-### The virtual processor
+### The virtual device
 
-The **Processor** is the compiled chip — a datapath circuit plus
+The **Machine** is the compiled chip — a datapath circuit plus
 configuration (embedding table, RoPE tables, KV cache layout).
-The **NativeRunner** is the CPU emulation of this processor,
+The **VirtualDevice** is the CPU emulation of this machine,
 implemented entirely in C:
 
 ```
@@ -174,14 +174,14 @@ src/kllm/
 │   └── circuit_tokenizer.py# Compile BPE tokenizer into circuit graph ROMs
 ├── device/               # Assembled chip and runtime
 │   ├── chip.py           #   Chip: compiled model artifact (bytes in → bytes out)
-│   ├── processor.py      #   Processor: datapath + tokenizer + config (the virtual device)
-│   └── native_runner.py  #   NativeRunner: C virtual processor emulation (ctypes bridge)
+│   ├── machine.py        #   Machine: datapath + tokenizer + config (the compiled device)
+│   └── virtual_device.py #   VirtualDevice: CPU emulation of the machine (ctypes bridge)
 └── hdl/                  # Hardware synthesis and simulation
     ├── hdl_export.py     #   Verilog / VHDL export + resource estimation
     └── hdl_simulate.py   #   Verilog simulation (iverilog + vvp)
 
 csrc/
-├── _tape_runner.c        # C virtual processor: tape engine + BPE encode/decode + full inference loop
+├── _tape_runner.c        # C virtual device: tape engine + BPE encode/decode + full inference loop
 └── _circuit_eval.c       # C tensor ops: add/sub/mul/div, matmul, LUT activations, reductions
 ```
 
@@ -190,7 +190,7 @@ csrc/
 ```
 mychip/
 ├── chip.json             # chip metadata
-├── processor.json        # processor config (dims, heads, layer count, slot maps)
+├── processor.json        # machine config (dims, heads, layer count, slot maps)
 ├── circuit/              # compiled datapath circuit graph (binary nodes + const data)
 ├── q8/                   # INT8 quantised weight matrices
 ├── tables/               # embed_table.npy, rope_cos.npy, rope_sin.npy

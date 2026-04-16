@@ -1,7 +1,7 @@
 """Chip — user-facing compiled model artifact.
 
 A Chip is a self-contained directory containing everything needed to
-run inference: the Processor (datapath + tokenizer circuit + ROMs).
+run inference: the Machine (datapath + tokenizer circuit + ROMs).
 
 The chip takes raw UTF-8 bytes in and produces UTF-8 bytes out —
 everything (tokenization, inference, detokenization) runs through
@@ -13,8 +13,8 @@ Usage::
     kllm infer ./mychip --max-tokens 50 Hello world
 
 Internally, a Chip wraps:
-- ``Processor`` — the complete device (datapath + tokenizer circuit + config)
-- ``NativeRunner`` — CPU simulation of the chip
+- ``Machine`` — the complete device (datapath + tokenizer circuit + config)
+- ``VirtualDevice`` — CPU simulation of the chip
 
 Chat template rendering is a simple string formatter — not a circuit op.
 """
@@ -27,8 +27,8 @@ import time
 
 import numpy as np
 
-from kllm.device.processor import Processor
-from kllm.device.native_runner import NativeRunner
+from kllm.device.machine import Machine
+from kllm.device.virtual_device import VirtualDevice
 
 
 # ------------------------------------------------------------------
@@ -65,7 +65,7 @@ def format_chat(
 
 
 class Chip:
-    """A compiled chip — Processor with circuit tokenizer.
+    """A compiled chip — Machine with circuit tokenizer.
 
     Create with ``Chip.create()`` (downloads + compiles), or load an
     existing one with ``Chip.load()``.
@@ -74,11 +74,11 @@ class Chip:
     def __init__(
         self,
         path: str,
-        processor: Processor,
+        machine: Machine,
     ) -> None:
         self.path = path
-        self.processor = processor
-        self._runner: NativeRunner | None = None
+        self.machine = machine
+        self._runner: VirtualDevice | None = None
 
     @classmethod
     def create(
@@ -116,15 +116,15 @@ class Chip:
                 eos_str = cfg.get("eos_token", "</s>")
                 eos_token_id = vocab.get(eos_str, 2)
 
-        # 3. Build the processor — datapath + tokenizer circuit
-        print("[chip] Building processor …")
-        processor = Processor.build(
+        # 3. Build the machine — datapath + tokenizer circuit
+        print("[chip] Building machine …")
+        machine = Machine.build(
             fabric, eos_token_id, tokenizer_dir=tok_dir,
         )
 
-        # 4. Save processor artifacts
-        print("[chip] Saving processor …")
-        processor.save(chip_path)
+        # 4. Save machine artifacts
+        print("[chip] Saving machine …")
+        machine.save(chip_path)
 
         # 5. Write chip metadata
         metadata = {
@@ -132,17 +132,17 @@ class Chip:
             "model_name": model_name,
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "eos_token_id": eos_token_id,
-            "max_seq_len": processor.max_seq_len,
-            "vocab_size": processor.vocab_size,
-            "hidden_dim": processor.hidden_dim,
-            "num_layers": processor.num_layers,
-            "head_dim": processor.head_dim,
+            "max_seq_len": machine.max_seq_len,
+            "vocab_size": machine.vocab_size,
+            "hidden_dim": machine.hidden_dim,
+            "num_layers": machine.num_layers,
+            "head_dim": machine.head_dim,
         }
         with open(os.path.join(chip_path, "chip.json"), "w") as f:
             json.dump(metadata, f, indent=2)
 
         print(f"[chip] Done — saved to {chip_path}")
-        return cls(path=chip_path, processor=processor)
+        return cls(path=chip_path, machine=machine)
 
     @classmethod
     def load(cls, chip_path: str) -> "Chip":
@@ -154,13 +154,13 @@ class Chip:
                 "Run `kllm create --model <model> <path>` first."
             )
 
-        processor = Processor.load(chip_path)
-        return cls(path=chip_path, processor=processor)
+        machine = Machine.load(chip_path)
+        return cls(path=chip_path, machine=machine)
 
-    def _get_runner(self) -> NativeRunner:
-        """Lazy-init the native runner (the virtual device)."""
+    def _get_runner(self) -> VirtualDevice:
+        """Lazy-init the virtual device."""
         if self._runner is None:
-            self._runner = NativeRunner(self.processor)
+            self._runner = VirtualDevice(self.machine)
         return self._runner
 
     def infer(self, prompt: str, max_tokens: int = 50) -> str:
@@ -176,7 +176,7 @@ class Chip:
 
         runner = self._get_runner()
 
-        if self.processor.tokenizer_graph is None:
+        if self.machine.tokenizer_graph is None:
             raise RuntimeError(
                 "No circuit tokenizer found in this chip. "
                 "Re-create the chip with `kllm create` to compile the "
@@ -194,7 +194,7 @@ class Chip:
 
         runner = self._get_runner()
 
-        if self.processor.tokenizer_graph is None:
+        if self.machine.tokenizer_graph is None:
             raise RuntimeError(
                 "No circuit tokenizer found in this chip. "
                 "Re-create the chip with `kllm create` to compile the "

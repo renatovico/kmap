@@ -136,7 +136,7 @@ def print_generate_report(stats: dict) -> None:
         return
 
     print("\n" + "=" * w)
-    print("  kllm — HuggingFace vs Chip Processor")
+    print("  kllm — HuggingFace vs Chip Machine")
     print("=" * w)
     print(f"  Prompt     : {stats['text']!r}")
     print(f"  Max tokens : {stats['max_tokens']}")

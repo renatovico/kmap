@@ -1,6 +1,6 @@
-"""Processor — the complete virtual device.
+"""Machine — the compiled device definition.
 
-The Processor is a self-contained chip definition.  It bundles every
+The Machine is a self-contained chip definition.  It bundles every
 component needed for autonomous inference:
 
 - **Datapath**: CircuitGraph for one decode step (weights = CONST,
@@ -10,8 +10,8 @@ component needed for autonomous inference:
 - **RoPE tables**: Position → cos/sin values (ROM).
 - **Config**: eos_token_id, max_seq_len, num_layers, dimensions.
 
-The same Processor drives:
-1. **Native execution** via ``NativeRunner`` (in ``native_runner.py``)
+The same Machine drives:
+1. **CPU emulation** via ``VirtualDevice`` (in ``virtual_device.py``)
    — the CPU simulation of the chip.
 2. **HDL export** (Verilog FSM + datapath + ROMs).
 3. **HDL simulation** (iverilog with golden reference).
@@ -22,14 +22,14 @@ algorithm is a ROM-backed FSM expressed as BPE_ENCODE/BPE_DECODE ops.
 
 Usage::
 
-    processor = Processor.build(fabric, eos_token_id=2,
-                                tokenizer_dir="./mychip/tokenizer")
-    processor.save("./mychip")
-    processor = Processor.load("./mychip")
+    machine = Machine.build(fabric, eos_token_id=2,
+                            tokenizer_dir="./mychip/tokenizer")
+    machine.save("./mychip")
+    machine = Machine.load("./mychip")
 
-    from kllm.device.native_runner import NativeRunner
-    runner = NativeRunner(processor)
-    output_bytes = runner.infer(b"Hello world", max_tokens=50)
+    from kllm.device.virtual_device import VirtualDevice
+    vdev = VirtualDevice(machine)
+    output_bytes = vdev.infer(b"Hello world", max_tokens=50)
 """
 
 from __future__ import annotations
@@ -53,7 +53,7 @@ from kllm.compiler.circuit_tokenizer import (
 from kllm.graph.graph_optimizer import optimize_graph
 
 
-class Processor:
+class Machine:
     """Complete inference device — datapath + tokenizer graph + ROMs + config.
 
     The processor is the compiled chip: everything needed to run
@@ -104,14 +104,14 @@ class Processor:
         eos_token_id: int,
         max_seq: int = 2048,
         tokenizer_dir: str | None = None,
-    ) -> "Processor":
+    ) -> "Machine":
         """Build a processor from a loaded Fabric.
 
         1. Compile single-token decode template (weights = CONST).
         2. Optimise the datapath graph.
         3. Extract embed table and RoPE tables.
         4. Compile tokenizer graph from JSON.
-        5. Bundle into a Processor.
+        5. Bundle into a Machine.
 
         Parameters
         ----------
@@ -276,7 +276,7 @@ class Processor:
             json.dump(config, f, indent=2)
 
     @classmethod
-    def load(cls, chip_dir: str) -> "Processor":
+    def load(cls, chip_dir: str) -> "Machine":
         """Load a processor from disk."""
         with open(os.path.join(chip_dir, "processor.json")) as f:
             config = json.load(f)

@@ -1,7 +1,7 @@
-"""Tests for the Processor and NativeRunner.
+"""Tests for the Machine and VirtualDevice.
 
 Uses the MockFabric from test_circuit_compiler to build a tiny
-processor and verify that NativeRunner produces valid output.
+processor and verify that VirtualDevice produces valid output.
 """
 
 import numpy as np
@@ -9,8 +9,8 @@ import pytest
 import os
 import tempfile
 
-from kllm.device.processor import Processor
-from kllm.device.native_runner import NativeRunner
+from kllm.device.machine import Machine
+from kllm.device.virtual_device import VirtualDevice
 from kllm.graph.circuit_graph import CircuitGraph, Op
 
 
@@ -20,13 +20,13 @@ from kllm.graph.circuit_graph import CircuitGraph, Op
 from tests.test_circuit_compiler import MockFabric
 
 
-class TestProcessorBuild:
-    """Test Processor.build() with a mock fabric."""
+class TestMachineBuild:
+    """Test Machine.build() with a mock fabric."""
 
     def test_build_creates_processor(self):
         fab = MockFabric(num_layers=1, hidden_size=16, num_heads=2,
                          num_kv_heads=2, intermediate_size=32, vocab_size=64)
-        proc = Processor.build(fab, eos_token_id=2)
+        proc = Machine.build(fab, eos_token_id=2)
 
         assert isinstance(proc.datapath, CircuitGraph)
         assert proc.vocab_size == 64
@@ -38,14 +38,14 @@ class TestProcessorBuild:
 
     def test_build_has_embed_table(self):
         fab = MockFabric(num_layers=1, vocab_size=64, hidden_size=16)
-        proc = Processor.build(fab, eos_token_id=2)
+        proc = Machine.build(fab, eos_token_id=2)
 
         assert proc.embed_table.shape == (64, 16)
         assert proc.embed_table.dtype == np.float32
 
     def test_build_has_rope_tables(self):
         fab = MockFabric(num_layers=1, hidden_size=16, num_heads=2)
-        proc = Processor.build(fab, eos_token_id=2)
+        proc = Machine.build(fab, eos_token_id=2)
 
         assert proc.rope_cos.shape == (2048, 8)  # head_dim = 16 // 2 = 8
         assert proc.rope_sin.shape == (2048, 8)
@@ -53,7 +53,7 @@ class TestProcessorBuild:
 
     def test_build_has_input_output_maps(self):
         fab = MockFabric(num_layers=2)
-        proc = Processor.build(fab, eos_token_id=2)
+        proc = Machine.build(fab, eos_token_id=2)
 
         # Input map must have token_embed, rope_cos, rope_sin, per-layer KV
         assert "token_embed" in proc.input_map
@@ -70,18 +70,18 @@ class TestProcessorBuild:
     def test_build_optimizes_graph(self):
         """Optimised graph should be smaller than raw."""
         fab = MockFabric(num_layers=1)
-        proc = Processor.build(fab, eos_token_id=2)
+        proc = Machine.build(fab, eos_token_id=2)
         # After optimization, graph should exist and be non-empty
         assert len(proc.datapath) > 0
 
 
-class TestProcessorSaveLoad:
-    """Test Processor serialization round-trip."""
+class TestMachineSaveLoad:
+    """Test Machine serialization round-trip."""
 
     def test_save_load_roundtrip(self):
         fab = MockFabric(num_layers=1, hidden_size=16, num_heads=2,
                          num_kv_heads=2, intermediate_size=32, vocab_size=64)
-        proc = Processor.build(fab, eos_token_id=2)
+        proc = Machine.build(fab, eos_token_id=2)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             proc.save(tmpdir)
@@ -94,7 +94,7 @@ class TestProcessorSaveLoad:
             assert os.path.exists(os.path.join(tmpdir, "tables", "rope_sin.npy"))
 
             # Load back
-            loaded = Processor.load(tmpdir)
+            loaded = Machine.load(tmpdir)
 
             assert loaded.vocab_size == proc.vocab_size
             assert loaded.num_layers == proc.num_layers
@@ -110,15 +110,15 @@ class TestProcessorSaveLoad:
             np.testing.assert_array_equal(loaded.rope_sin, proc.rope_sin)
 
 
-class TestNativeRunner:
-    """Test NativeRunner (C virtual processor)."""
+class TestVirtualDevice:
+    """Test VirtualDevice (C virtual processor)."""
 
     def test_construct_without_tokenizer(self):
-        """NativeRunner can be constructed even without tokenizer ROMs."""
+        """VirtualDevice can be constructed even without tokenizer ROMs."""
         fab = MockFabric(num_layers=1, hidden_size=16, num_heads=2,
                          num_kv_heads=2, intermediate_size=32, vocab_size=64)
-        proc = Processor.build(fab, eos_token_id=2)
-        runner = NativeRunner(proc)
+        proc = Machine.build(fab, eos_token_id=2)
+        runner = VirtualDevice(proc)
 
         # No tokenizer means no BPE ROMs
         assert runner._bpe_roms == {}
@@ -127,8 +127,8 @@ class TestNativeRunner:
         """infer_bytes raises RuntimeError without tokenizer ROMs."""
         fab = MockFabric(num_layers=1, hidden_size=16, num_heads=2,
                          num_kv_heads=2, intermediate_size=32, vocab_size=64)
-        proc = Processor.build(fab, eos_token_id=2)
-        runner = NativeRunner(proc)
+        proc = Machine.build(fab, eos_token_id=2)
+        runner = VirtualDevice(proc)
 
         with pytest.raises(RuntimeError, match="No BPE ROMs"):
             runner.infer_bytes(b"Hello", max_tokens=1)
@@ -137,8 +137,8 @@ class TestNativeRunner:
         """Empty input returns empty bytes."""
         fab = MockFabric(num_layers=1, hidden_size=16, num_heads=2,
                          num_kv_heads=2, intermediate_size=32, vocab_size=64)
-        proc = Processor.build(fab, eos_token_id=2)
-        runner = NativeRunner(proc)
+        proc = Machine.build(fab, eos_token_id=2)
+        runner = VirtualDevice(proc)
 
         result = runner.infer_bytes(b"", max_tokens=5)
         assert result == b""
@@ -151,13 +151,13 @@ MYCHIP_PATH = os.path.join(os.path.dirname(__file__), "..", "mychip")
     not os.path.isdir(MYCHIP_PATH),
     reason="mychip directory not found (integration test)"
 )
-class TestNativeRunnerIntegration:
+class TestVirtualDeviceIntegration:
     """Integration tests using a real compiled chip."""
 
     @pytest.fixture(autouse=True)
     def setup(self):
-        proc = Processor.load(MYCHIP_PATH)
-        self.runner = NativeRunner(proc)
+        proc = Machine.load(MYCHIP_PATH)
+        self.runner = VirtualDevice(proc)
 
     def test_infer_bytes_returns_bytes(self):
         result = self.runner.infer_bytes(b"Hello", max_tokens=3)
@@ -175,25 +175,25 @@ class TestNativeRunnerIntegration:
 
     def test_infer_bytes_deterministic(self):
         """Same input → same output (greedy decode)."""
-        proc = Processor.load(MYCHIP_PATH)
-        r1 = NativeRunner(proc)
+        proc = Machine.load(MYCHIP_PATH)
+        r1 = VirtualDevice(proc)
         out1 = r1.infer_bytes(b"Hello world", max_tokens=3)
 
-        r2 = NativeRunner(proc)
+        r2 = VirtualDevice(proc)
         out2 = r2.infer_bytes(b"Hello world", max_tokens=3)
 
         assert out1 == out2
 
     def test_save_load_then_infer_matches(self):
         """Inference after save/load must match original."""
-        proc = Processor.load(MYCHIP_PATH)
-        runner1 = NativeRunner(proc)
+        proc = Machine.load(MYCHIP_PATH)
+        runner1 = VirtualDevice(proc)
         output1 = runner1.infer_bytes(b"Hello", max_tokens=3)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             proc.save(tmpdir)
-            loaded = Processor.load(tmpdir)
-            runner2 = NativeRunner(loaded)
+            loaded = Machine.load(tmpdir)
+            runner2 = VirtualDevice(loaded)
             output2 = runner2.infer_bytes(b"Hello", max_tokens=3)
 
         assert output1 == output2

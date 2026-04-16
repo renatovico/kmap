@@ -1,6 +1,6 @@
-"""NativeRunner — C virtual processor for chip simulation.
+"""VirtualDevice — CPU emulation of the compiled machine.
 
-The NativeRunner is the CPU emulation of the compiled Processor chip.
+The VirtualDevice is the CPU emulation of the compiled Machine chip.
 Everything runs in C — tokenization, prefill, decode, detokenization,
 KV cache management. Python is only the thin ctypes bridge.
 
@@ -15,11 +15,11 @@ All data flows through the device's circuit tape — no Python in the loop.
 
 Usage::
 
-    from kllm.device.processor import Processor
-    from kllm.device.native_runner import NativeRunner
+    from kllm.device.machine import Machine
+    from kllm.device.virtual_device import VirtualDevice
 
-    processor = Processor.load("./mychip")
-    runner = NativeRunner(processor)
+    machine = Machine.load("./mychip")
+    vdev = VirtualDevice(machine)
 
     # Streaming (bytes in, bytes out — each chunk as generated):
     for chunk in runner.infer_bytes_streaming(b"Hello world", max_tokens=50):
@@ -43,7 +43,7 @@ from kllm.graph.circuit_executor import (
     _get_tape_lib,
 )
 from kllm.graph.circuit_graph import Op
-from kllm.device.processor import Processor
+from kllm.device.machine import Machine
 
 
 # ctypes convenience
@@ -66,15 +66,15 @@ def _int_arr(vals):
     return (ctypes.c_int * len(vals))(*vals)
 
 
-class NativeRunner:
+class VirtualDevice:
     """C virtual processor — emulates the chip entirely in C.
 
     All inference runs through ``processor_infer_bytes()`` in the C
     tape runner. Python only marshals data in/out via ctypes.
     """
 
-    def __init__(self, processor: Processor) -> None:
-        self.proc = processor
+    def __init__(self, machine: Machine) -> None:
+        self.proc = machine
 
         # Load the C tape runner library
         self._lib = _get_tape_lib()
@@ -84,13 +84,13 @@ class NativeRunner:
                 "Recompile csrc/_tape_runner.c.")
 
         # Pre-compute datapath constants and build the C tape runner
-        self._const_cache = precompute_consts(processor.datapath)
+        self._const_cache = precompute_consts(machine.datapath)
 
         # Bootstrap CTapeRunner with a sample input (size-1 KV cache
         # to avoid zero-dim issues during tape compilation)
         sample = self._build_sample_inputs()
         self._c_runner = CTapeRunner(
-            processor.datapath, self._const_cache,
+            machine.datapath, self._const_cache,
             sample_inputs=sample)
 
         # Extract BPE ROM arrays from the tokenizer circuit graph
@@ -200,7 +200,7 @@ class NativeRunner:
         if num_special > 1:
             bos_token_id = int(special_ids[1])
 
-        # Processor resources
+        # Machine resources
         embed = np.ascontiguousarray(p.embed_table, dtype=np.float32)
         rope_cos = np.ascontiguousarray(p.rope_cos, dtype=np.float32)
         rope_sin = np.ascontiguousarray(p.rope_sin, dtype=np.float32)
@@ -255,7 +255,7 @@ class NativeRunner:
             special_ids.ctypes.data_as(_I32P),
             num_special,
             bos_token_id,
-            # Processor resources
+            # Machine resources
             embed.ctypes.data_as(_FP),
             p.vocab_size,
             p.hidden_dim,

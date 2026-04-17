@@ -104,7 +104,7 @@ class Fabric:
     # ------------------------------------------------------------------
 
     @lru_cache(maxsize=None)
-    def _get_transposed(self, layer_idx: int, proj: str) -> np.ndarray:
+    def get_transposed(self, layer_idx: int, proj: str) -> np.ndarray:
         """Return ``layers[layer_idx][proj].T`` as contiguous float32.
 
         Results are cached so that ``compile_model`` and
@@ -115,93 +115,29 @@ class Fabric:
             self.layers[layer_idx][proj].T, dtype=np.float32)
 
     @lru_cache(maxsize=None)
-    def _get_fused_qkv_t(self, layer_idx: int) -> np.ndarray:
+    def get_fused_qkv_t(self, layer_idx: int) -> np.ndarray:
         """Return ``[Wq | Wk | Wv].T`` — fused QKV weight matrix.
 
         Shape: (hidden_size, q_dim + kv_dim + kv_dim).
         One matmul replaces three separate Q/K/V projections.
         """
-        q_t = self._get_transposed(layer_idx, "q_proj")
-        k_t = self._get_transposed(layer_idx, "k_proj")
-        v_t = self._get_transposed(layer_idx, "v_proj")
+        q_t = self.get_transposed(layer_idx, "q_proj")
+        k_t = self.get_transposed(layer_idx, "k_proj")
+        v_t = self.get_transposed(layer_idx, "v_proj")
         return np.ascontiguousarray(
             np.concatenate([q_t, k_t, v_t], axis=1))
 
     @lru_cache(maxsize=None)
-    def _get_fused_gate_up_t(self, layer_idx: int) -> np.ndarray:
+    def get_fused_gate_up_t(self, layer_idx: int) -> np.ndarray:
         """Return ``[Wgate | Wup].T`` — fused Gate+Up weight matrix.
 
         Shape: (hidden_size, 2 * intermediate_size).
         One matmul replaces two separate gate/up projections.
         """
-        gate_t = self._get_transposed(layer_idx, "gate_proj")
-        up_t = self._get_transposed(layer_idx, "up_proj")
+        gate_t = self.get_transposed(layer_idx, "gate_proj")
+        up_t = self.get_transposed(layer_idx, "up_proj")
         return np.ascontiguousarray(
             np.concatenate([gate_t, up_t], axis=1))
-
-    # ------------------------------------------------------------------
-    # INT8 quantization cache (disk-backed)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _quantize_per_column(w_f32: np.ndarray
-                             ) -> tuple[np.ndarray, np.ndarray]:
-        """Per-output-channel absmax quantization to int8.
-
-        Returns (w_q8, scales) where ``w_f32 ≈ w_q8.astype(f32) * scales``.
-        """
-        amax = np.abs(w_f32).max(axis=0)
-        amax = np.where(amax == 0, 1.0, amax)  # avoid div-by-zero
-        scales = (amax / 127.0).astype(np.float32)
-        w_q8 = np.clip(np.round(w_f32 / scales), -128, 127).astype(np.int8)
-        return w_q8, scales
-
-    def _q8_cache_path(self, name: str
-                       ) -> tuple[str, str]:
-        """Return disk paths for cached (w_q8, scales) arrays."""
-        q8_dir = os.path.join(self.save_dir, "q8")
-        return (os.path.join(q8_dir, f"{name}_q8.npy"),
-                os.path.join(q8_dir, f"{name}_scales.npy"))
-
-    def _load_or_quantize(self, name: str, w_f32_fn
-                          ) -> tuple[np.ndarray, np.ndarray]:
-        """Load cached INT8 weights from disk, or quantize and save."""
-        q8_path, scales_path = self._q8_cache_path(name)
-        if os.path.exists(q8_path) and os.path.exists(scales_path):
-            return np.load(q8_path), np.load(scales_path)
-        w_q8, scales = self._quantize_per_column(w_f32_fn())
-        os.makedirs(os.path.dirname(q8_path), exist_ok=True)
-        np.save(q8_path, w_q8)
-        np.save(scales_path, scales)
-        return w_q8, scales
-
-    @lru_cache(maxsize=None)
-    def get_quantized(self, layer_idx: int, proj: str
-                      ) -> tuple[np.ndarray, np.ndarray]:
-        """Return ``(W_q8, scales)`` for a single projection (transposed).
-
-        W_q8 shape: (in_features, out_features) int8
-        scales shape: (out_features,) float32
-        """
-        return self._load_or_quantize(
-            f"L{layer_idx}_{proj}",
-            lambda: self._get_transposed(layer_idx, proj))
-
-    @lru_cache(maxsize=None)
-    def get_quantized_fused_qkv(self, layer_idx: int
-                                ) -> tuple[np.ndarray, np.ndarray]:
-        """Return ``(W_q8, scales)`` for fused QKV (transposed)."""
-        return self._load_or_quantize(
-            f"L{layer_idx}_fused_qkv",
-            lambda: self._get_fused_qkv_t(layer_idx))
-
-    @lru_cache(maxsize=None)
-    def get_quantized_fused_gate_up(self, layer_idx: int
-                                    ) -> tuple[np.ndarray, np.ndarray]:
-        """Return ``(W_q8, scales)`` for fused GateUp (transposed)."""
-        return self._load_or_quantize(
-            f"L{layer_idx}_fused_gate_up",
-            lambda: self._get_fused_gate_up_t(layer_idx))
 
     # ------------------------------------------------------------------
     # Class method: download from HuggingFace and cache

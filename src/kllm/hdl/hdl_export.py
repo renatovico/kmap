@@ -574,14 +574,6 @@ def _emit_node_verilog(
         _L(f"        .a(n_{node.inputs[0]}), .b(n_{node.inputs[1]}), .y(n_{node.id})")
         _L(f"    );")
 
-    elif node.op == Op.MATMUL_Q8:
-        size = _tensor_bits(node, float_width)
-        _L(f"    // matmul_q8: {node.name}")
-        _L(f"    wire [{size - 1}:0] n_{node.id};")
-        _L(f"    fp_matmul_q8 u_{node.id} (")
-        _L(f"        .x(n_{node.inputs[0]}), .w_q8(n_{node.inputs[1]}), .scales(n_{node.inputs[2]}), .y(n_{node.id})")
-        _L(f"    );")
-
     elif node.op in (Op.MAX, Op.CMP_LE, Op.MUX):
         size = _tensor_bits(node, float_width)
         _L(f"    // {node.op.value}: {node.name}")
@@ -643,10 +635,6 @@ def _emit_node_vhdl(
         _L(f"    -- matmul: {node.name}")
         _L(f"    n_{node.id} <= fp_matmul(n_{node.inputs[0]}, n_{node.inputs[1]});")
 
-    elif node.op == Op.MATMUL_Q8:
-        _L(f"    -- matmul_q8: {node.name}")
-        _L(f"    n_{node.id} <= fp_matmul_q8(n_{node.inputs[0]}, n_{node.inputs[1]}, n_{node.inputs[2]});")
-
     elif node.op in (Op.RESHAPE, Op.TRANSPOSE, Op.CONCAT, Op.REPEAT,
                      Op.SLICE, Op.EXPAND_DIMS, Op.CAST):
         _L(f"    -- {node.op.value}: {node.name} (wire routing)")
@@ -678,19 +666,6 @@ def _emit_helper_modules(
             ops_used.add(node.op.value)
         if node.op == Op.LUT:
             luts_used.add(node.params.get("fn", ""))
-
-    if "matmul_q8" in {node.op.value for node in graph.nodes}:
-        _L(f"")
-        _L(f"// Behavioral INT8 matmul — replace with vendor IP for synthesis")
-        _L(f"module fp_matmul_q8 (")
-        _L(f"    input  wire [31:0] x,")
-        _L(f"    input  wire [ 7:0] w_q8,")
-        _L(f"    input  wire [31:0] scales,")
-        _L(f"    output wire [31:0] y")
-        _L(f");")
-        _L(f"    // Behavioral: y = x * (float)w_q8 * scales")
-        _L(f"    assign y = 32'b0;  // placeholder — implement as DSP MAC chain")
-        _L(f"endmodule")
 
     for op in sorted(ops_used):
         op_sym = {"add": "+", "sub": "-", "mul": "*", "div": "/"}

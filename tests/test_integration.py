@@ -70,45 +70,22 @@ class MockFabric:
             self.layers.append(layer)
 
     @lru_cache(maxsize=None)
-    def _get_transposed(self, layer_idx, proj):
+    def get_transposed(self, layer_idx, proj):
         return np.ascontiguousarray(
             self.layers[layer_idx][proj].T, dtype=np.float32)
 
     @lru_cache(maxsize=None)
-    def _get_fused_qkv_t(self, layer_idx):
-        q_t = self._get_transposed(layer_idx, 'q_proj')
-        k_t = self._get_transposed(layer_idx, 'k_proj')
-        v_t = self._get_transposed(layer_idx, 'v_proj')
+    def get_fused_qkv_t(self, layer_idx):
+        q_t = self.get_transposed(layer_idx, 'q_proj')
+        k_t = self.get_transposed(layer_idx, 'k_proj')
+        v_t = self.get_transposed(layer_idx, 'v_proj')
         return np.ascontiguousarray(np.concatenate([q_t, k_t, v_t], axis=1))
 
     @lru_cache(maxsize=None)
-    def _get_fused_gate_up_t(self, layer_idx):
-        gate_t = self._get_transposed(layer_idx, 'gate_proj')
-        up_t = self._get_transposed(layer_idx, 'up_proj')
+    def get_fused_gate_up_t(self, layer_idx):
+        gate_t = self.get_transposed(layer_idx, 'gate_proj')
+        up_t = self.get_transposed(layer_idx, 'up_proj')
         return np.ascontiguousarray(np.concatenate([gate_t, up_t], axis=1))
-
-    @staticmethod
-    def _quantize_per_column(w_f32):
-        amax = np.abs(w_f32).max(axis=0)
-        amax = np.where(amax == 0, 1.0, amax)
-        scales = (amax / 127.0).astype(np.float32)
-        w_q8 = np.clip(np.round(w_f32 / scales), -128, 127).astype(np.int8)
-        return w_q8, scales
-
-    @lru_cache(maxsize=None)
-    def get_quantized(self, layer_idx, proj):
-        w_t = self._get_transposed(layer_idx, proj)
-        return self._quantize_per_column(w_t)
-
-    @lru_cache(maxsize=None)
-    def get_quantized_fused_qkv(self, layer_idx):
-        w_t = self._get_fused_qkv_t(layer_idx)
-        return self._quantize_per_column(w_t)
-
-    @lru_cache(maxsize=None)
-    def get_quantized_fused_gate_up(self, layer_idx):
-        w_t = self._get_fused_gate_up_t(layer_idx)
-        return self._quantize_per_column(w_t)
 
 
 @pytest.fixture

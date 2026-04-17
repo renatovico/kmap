@@ -49,7 +49,6 @@ enum {
     T_NEG       = 10,
     T_SQUARE    = 11,
     T_MATMUL    = 12,
-    T_MATMUL_Q8 = 13,
     T_SUM       = 14,
     T_MAX_RED   = 15,
     T_MEAN      = 16,
@@ -90,12 +89,6 @@ typedef struct {
     int out_shape[MAX_DIMS];
     int out_ndim;
     int out_size;
-
-    /* For MATMUL_Q8: pre-cached raw pointers */
-    const int8_t *wq8_ptr;
-    const float  *scales_ptr;
-    int K_q8, N_q8;
-    float *wf32_ptr;   /* pre-dequantized float32 weights (owned by tape) */
 
     /* For TRANSPOSE: axes */
     int axes[MAX_DIMS];
@@ -368,38 +361,6 @@ static void do_slice(float *out, const float *x,
     }
 }
 
-/* Persistent dequantization buffer — reused across calls */
-static float *g_dequant_buf = NULL;
-static int    g_dequant_cap = 0;
-
-static void do_matmul_q8(float *out, const float *x, int M, int K,
-                         const int8_t *W, int N, const float *scales,
-                         float *wf32) {
-    /* If pre-dequantized weights available, use BLAS directly */
-    if (wf32) {
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                    M, N, K,
-                    1.0f, x, K,
-                          wf32, N,
-                    0.0f, out, N);
-        return;
-    }
-    /* Fallback: dequantize on the fly */
-    for (int i = 0; i < M; i++) {
-        const float *x_row = x + i * K;
-        float *o_row = out + i * N;
-        memset(o_row, 0, N * sizeof(float));
-        for (int k = 0; k < K; k++) {
-            float xk = x_row[k];
-            const int8_t *w_row = W + k * N;
-            for (int j = 0; j < N; j++)
-                o_row[j] += xk * (float)w_row[j];
-        }
-        for (int j = 0; j < N; j++)
-            o_row[j] *= scales[j];
-    }
-}
-
 /* ================================================================
  * Public API: Tape context management
  * ================================================================ */
@@ -415,13 +376,6 @@ TapeCtx *tape_ctx_create(int n_slots, int n_instrs) {
 
 void tape_ctx_destroy(TapeCtx *ctx) {
     if (!ctx) return;
-    /* Free pre-dequantized Q8 weight buffers */
-    for (int i = 0; i < ctx->n_instrs; i++) {
-        if (ctx->tape[i].wf32_ptr) {
-            free(ctx->tape[i].wf32_ptr);
-            ctx->tape[i].wf32_ptr = NULL;
-        }
-    }
     for (int i = 0; i < ctx->n_slots; i++) {
         if (ctx->slots[i].owns_data && ctx->slots[i].data) {
             free(ctx->slots[i].data);
@@ -430,27 +384,6 @@ void tape_ctx_destroy(TapeCtx *ctx) {
     free(ctx->slots);
     free(ctx->tape);
     free(ctx);
-}
-
-/* Pre-dequantize all MATMUL_Q8 weights into float32 for BLAS.
- * Called once at tape setup time — amortized over all decode steps. */
-void tape_dequant_q8_weights(TapeCtx *ctx) {
-    for (int i = 0; i < ctx->n_instrs; i++) {
-        TapeInstr *op = &ctx->tape[i];
-        if (op->tag != T_MATMUL_Q8 || !op->wq8_ptr || op->wf32_ptr)
-            continue;
-        int K = op->K_q8, N = op->N_q8;
-        float *buf = (float *)malloc(K * N * sizeof(float));
-        const int8_t *W = op->wq8_ptr;
-        const float *scales = op->scales_ptr;
-        for (int k = 0; k < K; k++) {
-            const int8_t *w_row = W + k * N;
-            float *f_row = buf + k * N;
-            for (int j = 0; j < N; j++)
-                f_row[j] = (float)w_row[j] * scales[j];
-        }
-        op->wf32_ptr = buf;
-    }
 }
 
 /* Set slot shape and allocate data buffer */
@@ -666,19 +599,6 @@ void tape_run(TapeCtx *ctx) {
                                   s1->data + bi * b_mat, nn,
                             0.0f, out->data + bi * o_mat, nn);
             }
-            break;
-        }
-
-        case T_MATMUL_Q8: {
-            int M_q8 = s0->shape[0];
-            int out_sz = M_q8 * op->N_q8;
-            ensure_slot(out, out_sz);
-            out->ndim = 2; out->shape[0] = M_q8; out->shape[1] = op->N_q8;
-            out->size = out_sz;
-            do_matmul_q8(out->data, s0->data,
-                         M_q8, op->K_q8,
-                         op->wq8_ptr, op->N_q8,
-                         op->scales_ptr, op->wf32_ptr);
             break;
         }
 

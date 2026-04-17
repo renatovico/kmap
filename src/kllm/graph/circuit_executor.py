@@ -141,11 +141,6 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
     lib.ceval_copy.restype = None
     lib.ceval_copy.argtypes = [FP, FP, I]
 
-    # Quantized matmul (x_f32 @ W_int8 * scales_f32)
-    I8P = ctypes.POINTER(ctypes.c_int8)
-    lib.ceval_matmul_q8.restype = None
-    lib.ceval_matmul_q8.argtypes = [FP, FP, I, I, I8P, I, FP]
-
 
 # ---------------------------------------------------------------
 # Shape utilities (pure Python — no NumPy)
@@ -200,12 +195,6 @@ def _to_c_float(arr: np.ndarray) -> ctypes.POINTER(ctypes.c_float):
     return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
 
-def _to_c_int8(arr: np.ndarray) -> ctypes.POINTER(ctypes.c_int8):
-    """Get a ctypes int8 pointer to a contiguous int8 array."""
-    arr = np.ascontiguousarray(arr, dtype=np.int8)
-    return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_int8))
-
-
 def _to_c_int_array(values: tuple | list) -> ctypes.Array:
     """Create a ctypes int array from a Python sequence."""
     n = len(values)
@@ -245,7 +234,6 @@ _T_REPEAT = 13
 _T_SLICE = 14
 _T_CAST = 15
 _T_EXPAND_DIMS = 16
-_T_MATMUL_Q8 = 17
 _T_BPE_ENCODE = 18
 _T_BPE_DECODE = 19
 
@@ -367,20 +355,6 @@ class ExecutionPlan:
             elif node.op == Op.MATMUL:
                 tape.append((_T_MATMUL, nid, ins[0], ins[1]))
 
-            elif node.op == Op.MATMUL_Q8:
-                # inputs: [activation, weight_q8, scales]
-                # Pre-resolve CONST weight/scales pointers, shapes,
-                # and pre-allocate output buffer.
-                wq8_nid, scales_nid = ins[1], ins[2]
-                wq8_arr = base[wq8_nid]
-                scales_arr = base[scales_nid]
-                K_q8 = wq8_arr.shape[0]
-                N = wq8_arr.shape[-1]
-                wq8_ptr = const_ptrs.get(wq8_nid)
-                scales_ptr = const_ptrs.get(scales_nid)
-                tape.append((_T_MATMUL_Q8, nid, ins[0],
-                             wq8_ptr, K_q8, N, scales_ptr))
-
             elif node.op in _REDUCE_FN:
                 axis = node.params["axis"]
                 keepdims = node.params.get("keepdims", False)
@@ -461,19 +435,6 @@ class ExecutionPlan:
                     v[instr[1]] = np.zeros(out_shape, dtype=np.float32)
                 else:
                     v[instr[1]] = np.matmul(a, b)
-
-            elif tag == _T_MATMUL_Q8:
-                # (tag, nid, x_id, wq8_ptr, K, N, scales_ptr)
-                x = np.ascontiguousarray(v[instr[2]], dtype=np.float32)
-                K = instr[4]
-                N = instr[5]
-                out = np.empty((1, N), dtype=np.float32)
-                self._lib.ceval_matmul_q8(
-                    out.ctypes.data_as(_FP),
-                    x.ctypes.data_as(_FP), 1, K,
-                    instr[3], N,   # pre-cached wq8 pointer
-                    instr[6])      # pre-cached scales pointer
-                v[instr[1]] = out
 
             elif tag == _T_LUT:
                 # (tag, nid, i0, c_fn)
@@ -759,7 +720,6 @@ _CT_MAX       = 9
 _CT_NEG       = 10
 _CT_SQUARE    = 11
 _CT_MATMUL    = 12
-_CT_MATMUL_Q8 = 13
 _CT_SUM       = 14
 _CT_MAX_RED   = 15
 _CT_MEAN      = 16
@@ -800,11 +760,6 @@ class _TapeInstrFields(ctypes.Structure):
         ("out_shape", ctypes.c_int * 8),
         ("out_ndim", ctypes.c_int),
         ("out_size", ctypes.c_int),
-        ("wq8_ptr", ctypes.c_void_p),
-        ("scales_ptr", ctypes.c_void_p),
-        ("K_q8", ctypes.c_int),
-        ("N_q8", ctypes.c_int),
-        ("wf32_ptr", ctypes.c_void_p),
         ("axes", ctypes.c_int * 8),
         ("starts", ctypes.c_int * 8),
         ("stops", ctypes.c_int * 8),
@@ -907,20 +862,6 @@ class CTapeRunner:
                     out_s = s0[:-2] + (s0[-2], s1[-1])
                 shapes[nid] = out_s
                 instrs.append((_CT_MATMUL, nid, p))
-
-            elif node.op == Op.MATMUL_Q8:
-                wq8 = slot_data.get(ins[1])
-                scales = slot_data.get(ins[2])
-                s_in = shapes[ins[0]]
-                K_q8 = wq8.shape[0] if wq8 is not None else 0
-                N_q8 = wq8.shape[1] if wq8 is not None else 0
-                M = s_in[0] if len(s_in) >= 2 else 1
-                shapes[nid] = (M, N_q8)
-                p["wq8_ptr"] = wq8.ctypes.data if wq8 is not None else 0
-                p["scales_ptr"] = scales.ctypes.data if scales is not None else 0
-                p["K_q8"] = K_q8
-                p["N_q8"] = N_q8
-                instrs.append((_CT_MATMUL_Q8, nid, p))
 
             elif node.op in _REDUCE_TAG:
                 axis = node.params["axis"]
@@ -1124,13 +1065,6 @@ class CTapeRunner:
                     sz *= d
                 instr.out_size = sz
 
-            # MATMUL_Q8 pointers
-            if tag == _CT_MATMUL_Q8:
-                instr.wq8_ptr = p["wq8_ptr"]
-                instr.scales_ptr = p["scales_ptr"]
-                instr.K_q8 = p["K_q8"]
-                instr.N_q8 = p["N_q8"]
-
             # Transpose axes
             if "axes" in p:
                 for d, a in enumerate(p["axes"]):
@@ -1295,20 +1229,6 @@ def evaluate_c(graph: CircuitGraph,
                 values[nid] = np.zeros(out_shape, dtype=np.float32)
             else:
                 values[nid] = np.matmul(a, b)
-
-        elif node.op == Op.MATMUL_Q8:
-            x = np.ascontiguousarray(inp[0], dtype=np.float32)
-            wq8 = np.ascontiguousarray(inp[1], dtype=np.int8)
-            scales = np.ascontiguousarray(inp[2], dtype=np.float32)
-            M, K = x.shape[-2] if x.ndim >= 2 else 1, x.shape[-1]
-            N = wq8.shape[-1]
-            out = np.empty((M, N), dtype=np.float32)
-            lib.ceval_matmul_q8(
-                _to_c_float(out),
-                _to_c_float(x.reshape(M, K)), M, K,
-                _to_c_int8(wq8), N,
-                _to_c_float(scales))
-            values[nid] = out
 
         elif node.op in (Op.SUM, Op.MAX_REDUCE, Op.MEAN):
             x = np.asarray(inp[0], dtype=np.float32)

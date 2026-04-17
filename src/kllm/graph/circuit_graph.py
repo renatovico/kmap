@@ -76,7 +76,6 @@ class Op(str, Enum):
 
     # Linear algebra
     MATMUL      = "matmul"
-    MATMUL_Q8   = "matmul_q8"    # quantized: x_f32 @ W_int8 * scales
 
     # Reductions
     SUM         = "sum"
@@ -202,16 +201,6 @@ class CircuitGraph:
 
     def matmul(self, a: int, b: int, name: str = "") -> int:
         return self._add_node(Op.MATMUL, [a, b], name=name)
-
-    def matmul_q8(self, x: int, weight_q8: int, scales: int,
-                  name: str = "") -> int:
-        """Quantized matmul: x_f32 @ W_int8 * scales_f32.
-
-        Inputs: x (float32), weight_q8 (int8 CONST), scales (float32 CONST).
-        The executor reads 4x less weight memory.
-        """
-        return self._add_node(Op.MATMUL_Q8, [x, weight_q8, scales],
-                              name=name)
 
     # ---- Reductions ---------------------------------------------
 

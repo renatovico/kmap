@@ -146,13 +146,6 @@ def evaluate(graph: CircuitGraph,
             values[nid] = (np.asarray(inp[0], dtype=np.float32)
                            @ np.asarray(inp[1], dtype=np.float32))
 
-        elif node.op == Op.MATMUL_Q8:
-            # inp[0]=activation(f32), inp[1]=weight(int8), inp[2]=scales(f32)
-            x = np.asarray(inp[0], dtype=np.float32)
-            w_q8 = np.asarray(inp[1])
-            scales = np.asarray(inp[2], dtype=np.float32)
-            values[nid] = (x @ w_q8.astype(np.float32)) * scales
-
         elif node.op == Op.SUM:
             values[nid] = np.asarray(inp[0], dtype=np.float32).sum(
                 axis=node.params["axis"],

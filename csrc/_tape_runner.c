@@ -1025,6 +1025,7 @@ int bpe_decode(
     int vocab_size,
     const int32_t *special_ids, int num_special,
     int max_bytes,
+    int skip_leading_space,
     /* Output */
     uint8_t *out_bytes)
 {
@@ -1055,7 +1056,7 @@ int bpe_decode(
 
     /* Second pass: replace metaspace ▁ with space, skip leading space */
     int out_len = 0;
-    int skip_first_space = 1;
+    int skip_first_space = skip_leading_space;
     int i = 0;
     while (i < raw_len && out_len < max_bytes) {
         if (is_meta(raw, i, raw_len)) {
@@ -1278,7 +1279,8 @@ int processor_infer_bytes(
                 &single_tok, 1,
                 id_to_bytes_rom, id_to_offsets, vocab_size,
                 special_ids, num_special,
-                max_bpe_bytes, dec_buf);
+                max_bpe_bytes, (generated == 1) ? 1 : 0,
+                dec_buf);
             int stop = callback(dec_buf, dec_len, user_data);
             if (stop) break;
         }

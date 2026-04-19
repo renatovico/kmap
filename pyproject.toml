@@ -31,9 +31,6 @@ gpu = [
     "cupy-cuda12x>=13.0",
 ]
 
-[project.scripts]
-kllm = "kllm.cli:main"
-
 [tool.ruff]
 line-length = 120
 target-version = "py313"

@@ -1,154 +1,32 @@
-"""Model weight loader.
+"""Model weight downloader.
 
-Loads transformer weights as plain NumPy float32 arrays.  Two paths:
+Downloads transformer weights from HuggingFace and saves them as
+plain NumPy float32 ``.npy`` files for the C compiler to consume.
 
-1. ``Fabric.from_pretrained(model_name, save_dir)`` — download from
-   HuggingFace, extract weights, cache as ``.npy`` files.
-2. ``Fabric(save_dir)`` — load from previously cached ``.npy`` files.
+Usage::
 
-This module is the *only* place that knows about the on-disk weight
-layout (``config.json``, ``embed_tokens.npy``, ``layer_<n>/``).
+    from kllm.compiler.fabric import Fabric
+    Fabric.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0", "./mychip")
 """
 
 import json
 import os
-from functools import lru_cache
 
 import numpy as np
-
-_LINEAR_NAMES = (
-    "q_proj", "k_proj", "v_proj", "o_proj",
-    "gate_proj", "up_proj", "down_proj",
-)
 
 _ATTN_WEIGHTS = ("q_proj", "k_proj", "v_proj", "o_proj")
 _MLP_WEIGHTS = ("gate_proj", "up_proj", "down_proj")
 
 
 class Fabric:
-    """Model weight container — exposes config + float32 weight arrays.
-
-    Attributes
-    ----------
-    num_layers, hidden_size, num_heads, num_kv_heads, intermediate_size,
-    vocab_size, rms_norm_eps, rope_theta, head_dim, num_groups
-        Model topology.
-    embed_tokens : ndarray (vocab_size, hidden_size)
-    lm_head : ndarray (vocab_size, hidden_size) — may be tied to embed_tokens
-    final_norm_weight : ndarray (hidden_size,)
-    layers : list[dict[str, ndarray]]
-        Per-layer weight arrays (q_proj, k_proj, … , layernorm weights).
-    """
-
-    def __init__(self, save_dir: str) -> None:
-        self.save_dir = save_dir
-
-        weights_dir = os.path.join(save_dir, "weights")
-        config_path = os.path.join(weights_dir, "config.json")
-
-        if not os.path.exists(config_path):
-            raise FileNotFoundError(
-                f"No compiled model found at {save_dir}. "
-                "Run `kllm create --model <model> <path>` first."
-            )
-
-        with open(config_path) as f:
-            cfg = json.load(f)
-
-        self.num_layers: int = cfg["num_layers"]
-        self.hidden_size: int = cfg["hidden_size"]
-        self.num_heads: int = cfg["num_attention_heads"]
-        self.num_kv_heads: int = cfg["num_key_value_heads"]
-        self.intermediate_size: int = cfg["intermediate_size"]
-        self.vocab_size: int = cfg["vocab_size"]
-        self.rms_norm_eps: float = cfg["rms_norm_eps"]
-        self.rope_theta: float = cfg["rope_theta"]
-        self.head_dim: int = self.hidden_size // self.num_heads
-        self.num_groups: int = self.num_heads // self.num_kv_heads
-
-        self._load_cached(weights_dir)
-
-    def _load_cached(self, weights_dir: str) -> None:
-        """Load float32 weights from .npy cache."""
-        self.embed_tokens = np.load(
-            os.path.join(weights_dir, "embed_tokens.npy"),
-        )
-        self.final_norm_weight = np.load(
-            os.path.join(weights_dir, "final_norm_weight.npy"),
-        )
-
-        lm_head_path = os.path.join(weights_dir, "lm_head.npy")
-        if os.path.exists(lm_head_path):
-            self.lm_head = np.load(lm_head_path)
-        else:
-            self.lm_head = self.embed_tokens  # tied
-
-        self.layers = []
-        for li in range(self.num_layers):
-            layer_dir = os.path.join(weights_dir, f"layer_{li}")
-            layer: dict[str, np.ndarray] = {}
-            for name in _LINEAR_NAMES:
-                layer[name] = np.load(
-                    os.path.join(layer_dir, f"{name}.npy"),
-                )
-            layer["input_layernorm_weight"] = np.load(
-                os.path.join(layer_dir, "input_layernorm_weight.npy"),
-            )
-            layer["post_attention_layernorm_weight"] = np.load(
-                os.path.join(layer_dir, "post_attention_layernorm_weight.npy"),
-            )
-            self.layers.append(layer)
-
-    # ------------------------------------------------------------------
-    # Transposed-weight cache (shared across all compile calls)
-    # ------------------------------------------------------------------
-
-    @lru_cache(maxsize=None)
-    def get_transposed(self, layer_idx: int, proj: str) -> np.ndarray:
-        """Return ``layers[layer_idx][proj].T`` as contiguous float32.
-
-        Results are cached so that ``compile_model`` and
-        ``compile_decode_template`` share the same array objects,
-        avoiding duplicate multi-GB allocations.
-        """
-        return np.ascontiguousarray(
-            self.layers[layer_idx][proj].T, dtype=np.float32)
-
-    @lru_cache(maxsize=None)
-    def get_fused_qkv_t(self, layer_idx: int) -> np.ndarray:
-        """Return ``[Wq | Wk | Wv].T`` — fused QKV weight matrix.
-
-        Shape: (hidden_size, q_dim + kv_dim + kv_dim).
-        One matmul replaces three separate Q/K/V projections.
-        """
-        q_t = self.get_transposed(layer_idx, "q_proj")
-        k_t = self.get_transposed(layer_idx, "k_proj")
-        v_t = self.get_transposed(layer_idx, "v_proj")
-        return np.ascontiguousarray(
-            np.concatenate([q_t, k_t, v_t], axis=1))
-
-    @lru_cache(maxsize=None)
-    def get_fused_gate_up_t(self, layer_idx: int) -> np.ndarray:
-        """Return ``[Wgate | Wup].T`` — fused Gate+Up weight matrix.
-
-        Shape: (hidden_size, 2 * intermediate_size).
-        One matmul replaces two separate gate/up projections.
-        """
-        gate_t = self.get_transposed(layer_idx, "gate_proj")
-        up_t = self.get_transposed(layer_idx, "up_proj")
-        return np.ascontiguousarray(
-            np.concatenate([gate_t, up_t], axis=1))
-
-    # ------------------------------------------------------------------
-    # Class method: download from HuggingFace and cache
-    # ------------------------------------------------------------------
+    """Download and cache HuggingFace model weights as .npy files."""
 
     @classmethod
     def from_pretrained(
         cls,
         model_name: str,
         save_dir: str = "./lossless_logic",
-    ) -> "Fabric":
+    ) -> None:
         """Download a model from HuggingFace and extract float32 weights.
 
         Requires ``torch`` and ``transformers`` (compile-time only).
@@ -250,4 +128,3 @@ class Fabric:
             torch.cuda.empty_cache()
 
         print(f"[+] Weights cached in {weights_dir}/")
-        return cls(save_dir)

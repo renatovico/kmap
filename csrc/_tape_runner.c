@@ -8,17 +8,17 @@
  * ceval_tape_run() is called each decode step with only the
  * INPUT slot data changing.
  *
- * Compile (macOS):
+ * Compile (shared library for Python):
  *   cc -O3 -shared -fPIC -march=native -o csrc/_tape_runner.so \
  *      csrc/_tape_runner.c -lm -framework Accelerate
  *
- * Compile (Linux):
- *   cc -O3 -shared -fPIC -march=native -o csrc/_tape_runner.so \
- *      csrc/_tape_runner.c -lm -lopenblas
+ * Compile (standalone binary):
+ *   cc -O3 -march=native -o kllm_infer \
+ *      csrc/kllm_infer.c csrc/_tape_runner.c \
+ *      -lm -framework Accelerate
  */
 
 #include <math.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,8 +29,7 @@
 #include <cblas.h>
 #endif
 
-#define MAX_DIMS 8
-#define MAX_CONCAT_INPUTS 8
+#include "tape_runner.h"
 
 /* ================================================================
  * Tape instruction tags (must match Python _T_* constants)
@@ -49,6 +48,7 @@ enum {
     T_NEG       = 10,
     T_SQUARE    = 11,
     T_MATMUL    = 12,
+    T_MATMUL_TT = 13,   /* Truth-table GEMV: codebook + index matrix, zero multiplies */
     T_SUM       = 14,
     T_MAX_RED   = 15,
     T_MEAN      = 16,
@@ -60,60 +60,6 @@ enum {
     T_SLICE     = 22,
     T_COPY      = 23,   /* for expand_dims, cast — just copy */
 };
-
-/* ================================================================
- * Slot: a tensor buffer with metadata
- * ================================================================ */
-typedef struct {
-    float    *data;          /* points into a big arena OR external */
-    int       shape[MAX_DIMS];
-    int       ndim;
-    int       size;          /* total number of float elements */
-    int       owns_data;     /* 1 if we allocated data (arena) */
-} Slot;
-
-/* ================================================================
- * Tape instruction: one op with all params inlined
- * ================================================================ */
-typedef struct {
-    int tag;
-    int out_slot;            /* output slot index */
-    int in0, in1, in2;       /* input slot indices (unused = -1) */
-
-    /* Op-specific params */
-    int axis;
-    int keepdims;
-    int repeats;
-
-    /* Shape params for binary ops (broadcasting) */
-    int out_shape[MAX_DIMS];
-    int out_ndim;
-    int out_size;
-
-    /* For TRANSPOSE: axes */
-    int axes[MAX_DIMS];
-
-    /* For SLICE: start/stop/step per dim */
-    int starts[MAX_DIMS];
-    int stops[MAX_DIMS];
-    int steps[MAX_DIMS];
-    int slice_out_shape[MAX_DIMS];
-    int slice_out_ndim;
-
-    /* For CONCAT: input slot indices, count, axis */
-    int concat_inputs[MAX_CONCAT_INPUTS];
-    int concat_n_inputs;
-} TapeInstr;
-
-/* ================================================================
- * Tape context: holds all state for repeated execution
- * ================================================================ */
-typedef struct {
-    Slot      *slots;
-    int        n_slots;
-    TapeInstr *tape;
-    int        n_instrs;
-} TapeCtx;
 
 /* ================================================================
  * Helper: shape utilities (duplicated from _circuit_eval.c to
@@ -415,6 +361,27 @@ void tape_slot_set_external(TapeCtx *ctx, int slot_idx,
     s->owns_data = 0;
 }
 
+/* Set up a slot as a truth-table weight matrix.
+ * codebook: float32 array of n_codes unique weight values
+ * w_indices: uint16 index matrix (K × N), row-major
+ * Each w_indices[i*N+j] is an index into codebook[],
+ * so weight[i][j] == codebook[w_indices[i*N+j]].  Lossless. */
+void tape_slot_set_truth_table(TapeCtx *ctx, int slot_idx,
+                               float *codebook, int n_codes,
+                               uint16_t *w_indices, int K, int N) {
+    Slot *s = &ctx->slots[slot_idx];
+    s->codebook = codebook;
+    s->w_indices = w_indices;
+    s->n_codes = n_codes;
+    s->tt_K = K;
+    s->tt_N = N;
+    /* Set shape so tape_run can read dimensions */
+    s->shape[0] = K;
+    s->shape[1] = N;
+    s->ndim = 2;
+    s->size = K * N;
+}
+
 /* Copy data into a slot (for INPUT nodes) */
 void tape_slot_write(TapeCtx *ctx, int slot_idx,
                      const float *data, int n) {
@@ -458,6 +425,16 @@ int tape_slot_read_shape(TapeCtx *ctx, int slot_idx, int *out_shape) {
 /* Get pointer to tape instruction for in-place setup */
 TapeInstr *tape_get_instr(TapeCtx *ctx, int instr_idx) {
     return &ctx->tape[instr_idx];
+}
+
+/* Get number of instructions in tape */
+int tape_ctx_n_instrs(TapeCtx *ctx) {
+    return ctx->n_instrs;
+}
+
+/* Get number of slots */
+int tape_ctx_n_slots(TapeCtx *ctx) {
+    return ctx->n_slots;
 }
 
 /* ================================================================
@@ -608,6 +585,74 @@ void tape_run(TapeCtx *ctx) {
                                 1.0f, s0->data + bi * a_mat, k,
                                       s1->data + bi * b_mat, nn,
                                 0.0f, out->data + bi * o_mat, nn);
+                }
+            }
+            break;
+        }
+
+        case T_MATMUL_TT: {
+            /* Truth-table GEMV: codebook + index matrix, zero multiplies
+             *
+             * Weight slot s1 carries:
+             *   codebook[n_codes]  — unique float32 weight values
+             *   w_indices[K*N]     — uint16 indices into codebook (row-major)
+             *
+             * Algorithm (m==1 decode path):
+             *   For each input position i:
+             *     1) Precompute LUT[v] = x[i] * codebook[v]  (n_codes muls)
+             *     2) Accumulate y[j] += LUT[w_indices[i*N+j]] (N lookups+adds)
+             *   Inner loop is ZERO multiplies — all compute is lookups+adds.
+             *   Weight data is 2x smaller (uint16 vs float32) → less bandwidth.
+             */
+            int a_ndim = s0->ndim;
+            int K = s1->tt_K;
+            int N = s1->tt_N;
+            int m = s0->shape[a_ndim - 2];
+            int batch = 1;
+            for (int d = 0; d < a_ndim - 2; d++) batch *= s0->shape[d];
+
+            int o_total = batch * m * N;
+            ensure_slot(out, o_total);
+            out->ndim = a_ndim;
+            for (int d = 0; d < a_ndim - 2; d++) out->shape[d] = s0->shape[d];
+            out->shape[a_ndim - 2] = m;
+            out->shape[a_ndim - 1] = N;
+            out->size = o_total;
+
+            if (m == 0 || K == 0 || N == 0 || batch == 0) {
+                if (o_total > 0)
+                    memset(out->data, 0, o_total * sizeof(float));
+                break;
+            }
+
+            float    *codebook = s1->codebook;
+            uint16_t *w_idx    = s1->w_indices;
+            int       n_codes  = s1->n_codes;
+            int a_mat = m * K, o_mat = m * N;
+
+            for (int bi = 0; bi < batch; bi++) {
+                float *x = s0->data + bi * a_mat;
+                float *y = out->data + bi * o_mat;
+
+                for (int mi = 0; mi < m; mi++) {
+                    float *xr = x + mi * K;
+                    float *yr = y + mi * N;
+                    memset(yr, 0, N * sizeof(float));
+
+                    /* Temp LUT — fits in L1 cache
+                     * (n_codes ≤ ~6000 → 24 KB) */
+                    float lut[n_codes];
+
+                    for (int i = 0; i < K; i++) {
+                        float xi = xr[i];
+                        /* Precompute: lut[v] = x[i] * codebook[v] */
+                        for (int v = 0; v < n_codes; v++)
+                            lut[v] = xi * codebook[v];
+                        /* Accumulate: y[j] += lut[w_indices[i*N+j]] */
+                        const uint16_t *row = &w_idx[i * N];
+                        for (int j = 0; j < N; j++)
+                            yr[j] += lut[row[j]];
+                    }
                 }
             }
             break;

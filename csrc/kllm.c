@@ -2,9 +2,10 @@
  * kllm.c — Main CLI binary for kllm.
  *
  * Subcommands:
- *   kllm create  --model <hf_name> <chip_dir>              (Python download + C compile)
- *   kllm infer   <chip_dir> [--max-tokens N] <prompt...>   (native C)
- *   kllm compare <chip_dir> [--max-tokens N] [prompt...]   (C infer + Python HF)
+ *   kllm create   --model <hf_name> <chip_dir>              (Python download + C compile)
+ *   kllm infer    <chip_dir> [--max-tokens N] <prompt...>   (native C)
+ *   kllm compare  <chip_dir> [--max-tokens N] [prompt...]   (C infer + Python HF)
+ *   kllm optimize <chip_dir> [-v]                           (gate minimization analysis)
  *
  * Build:
  *   make
@@ -17,6 +18,9 @@
 #include <time.h>
 
 #include "tape_runner.h"
+
+/* From kllm_gates.c */
+extern int cmd_optimize(int argc, char **argv);
 
 
 /* ================================================================
@@ -489,7 +493,15 @@ static int cmd_create(int argc, char **argv) {
 
     /* Step 2: Compile in C */
     printf("[kllm] Compiling chip …\n");
-    return compile_chip(chip_dir, 2048, model_name);
+    int rc = compile_chip(chip_dir, 2048, model_name);
+    if (rc != 0) return rc;
+
+    /* Step 3: Gate optimization analysis */
+    printf("\n[kllm] Gate analysis …\n");
+    char *opt_argv[] = { (char *)chip_dir };
+    cmd_optimize(1, opt_argv);
+
+    return 0;
 }
 
 
@@ -804,6 +816,7 @@ static void print_usage(const char *prog) {
         "  create   --model <hf_model> <chip_dir>    Download + compile chip\n"
         "  infer    <chip_dir> [--max-tokens N] <prompt...>   Run inference\n"
         "  compare  <chip_dir> [--max-tokens N] [prompt...]   Benchmark vs HF\n"
+        "  optimize <chip_dir> [-v]                          Gate minimization analysis\n"
         "\n"
         "Examples:\n"
         "  %s create --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 ./mychip\n"
@@ -826,6 +839,8 @@ int main(int argc, char **argv) {
         return cmd_infer(argc - 2, argv + 2);
     } else if (strcmp(cmd, "compare") == 0) {
         return cmd_compare(argc - 2, argv + 2);
+    } else if (strcmp(cmd, "optimize") == 0) {
+        return cmd_optimize(argc - 2, argv + 2);
     } else {
         fprintf(stderr, "Unknown command: %s\n\n", cmd);
         print_usage(argv[0]);

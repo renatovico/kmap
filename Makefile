@@ -26,9 +26,9 @@ PREFIX   ?= /usr/local
 
 all: kllm
 
-# ---- Main CLI binary (kllm.c + kllm_compile.c + _tape_runner.c) ----
-kllm: $(CSRC)/kllm.c $(CSRC)/kllm_compile.c $(CSRC)/_tape_runner.c $(CSRC)/tape_runner.h
-	$(CC) $(CFLAGS) -o $@ $(CSRC)/kllm.c $(CSRC)/kllm_compile.c $(CSRC)/_tape_runner.c $(LDFLAGS)
+# ---- Main CLI binary (kllm.c + kllm_compile.c + _tape_runner.c + kllm_gates.c) ----
+kllm: $(CSRC)/kllm.c $(CSRC)/kllm_compile.c $(CSRC)/_tape_runner.c $(CSRC)/kllm_gates.c $(CSRC)/tape_runner.h
+	$(CC) $(CFLAGS) -o $@ $(CSRC)/kllm.c $(CSRC)/kllm_compile.c $(CSRC)/_tape_runner.c $(CSRC)/kllm_gates.c $(LDFLAGS)
 
 # ---- Install ----
 install: kllm

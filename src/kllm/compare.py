@@ -42,6 +42,10 @@ def compare_chip(
 
     prompts = [text] if text else _BENCHMARK_PROMPTS
 
+    # Pre-warm the VirtualDevice so the first prompt doesn't pay
+    # one-time init cost (~4s of tape compilation + BPE ROM extraction).
+    chip._get_runner()
+
     results = []
     for prompt in prompts:
         stats = _compare_single(chip, model_name, prompt, max_tokens)

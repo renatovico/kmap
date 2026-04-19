@@ -592,12 +592,23 @@ void tape_run(TapeCtx *ctx) {
                 break;
             }
             int a_mat = m * k, b_mat = k * nn, o_mat = m * nn;
-            for (int bi = 0; bi < batch; bi++) {
-                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                            m, nn, k,
-                            1.0f, s0->data + bi * a_mat, k,
-                                  s1->data + bi * b_mat, nn,
-                            0.0f, out->data + bi * o_mat, nn);
+            if (m == 1) {
+                /* GEMV fast path: y = x @ B → y = B^T * x */
+                for (int bi = 0; bi < batch; bi++) {
+                    cblas_sgemv(CblasRowMajor, CblasTrans,
+                                k, nn,
+                                1.0f, s1->data + bi * b_mat, nn,
+                                      s0->data + bi * a_mat, 1,
+                                0.0f, out->data + bi * o_mat, 1);
+                }
+            } else {
+                for (int bi = 0; bi < batch; bi++) {
+                    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                                m, nn, k,
+                                1.0f, s0->data + bi * a_mat, k,
+                                      s1->data + bi * b_mat, nn,
+                                0.0f, out->data + bi * o_mat, nn);
+                }
             }
             break;
         }
@@ -1251,9 +1262,9 @@ int processor_infer_bytes(
     int *kv_seq_len = (int *)calloc(n_layers, sizeof(int));
     int *kv_cap = (int *)calloc(n_layers, sizeof(int));
 
-    /* Pre-allocate KV cache with 1 slot (avoids zero-dim) */
+    /* Pre-allocate KV cache for full sequence (avoids realloc during inference) */
     for (int li = 0; li < n_layers; li++) {
-        kv_cap[li] = kv_dim * 4; /* initial capacity: 4 positions */
+        kv_cap[li] = kv_dim * (max_seq_tokens > 64 ? max_seq_tokens : 64);
         kv_k_buf[li] = (float *)calloc(kv_cap[li], sizeof(float));
         kv_v_buf[li] = (float *)calloc(kv_cap[li], sizeof(float));
         kv_seq_len[li] = 0;
@@ -1289,21 +1300,10 @@ int processor_infer_bytes(
             int k_in = kv_in_slots[li * 2]; \
             int v_in = kv_in_slots[li * 2 + 1]; \
             int seq = kv_seq_len[li]; \
-            int sz = num_kv_heads * seq * head_dim; \
-            if (sz > 0) { \
-                tape_slot_write(ctx, k_in, kv_k_buf[li], sz); \
-                int kv_shape[3] = {num_kv_heads, seq, head_dim}; \
-                tape_slot_set_shape(ctx, k_in, kv_shape, 3); \
-                tape_slot_write(ctx, v_in, kv_v_buf[li], sz); \
-                tape_slot_set_shape(ctx, v_in, kv_shape, 3); \
-            } else { \
-                float zero = 0.0f; \
-                int kv_shape[3] = {num_kv_heads, 0, head_dim}; \
-                tape_slot_write(ctx, k_in, &zero, 0); \
-                tape_slot_set_shape(ctx, k_in, kv_shape, 3); \
-                tape_slot_write(ctx, v_in, &zero, 0); \
-                tape_slot_set_shape(ctx, v_in, kv_shape, 3); \
-            } \
+            int kv_shape[3] = {num_kv_heads, seq, head_dim}; \
+            /* Point input slots directly at our KV buffers (zero-copy) */ \
+            tape_slot_set_external(ctx, k_in, kv_k_buf[li], kv_shape, 3); \
+            tape_slot_set_external(ctx, v_in, kv_v_buf[li], kv_shape, 3); \
         } \
         tape_run(ctx); \
         for (int li = 0; li < n_layers; li++) { \
@@ -1430,10 +1430,18 @@ int processor_infer(
 {
     /* KV cache buffers per layer: (num_kv_heads, seq_so_far, head_dim) */
     int kv_dim = num_kv_heads * head_dim;
+    int max_seq = prompt_len + max_new_tokens;
     float **kv_k_buf = (float **)calloc(n_layers, sizeof(float *));
     float **kv_v_buf = (float **)calloc(n_layers, sizeof(float *));
     int *kv_seq_len = (int *)calloc(n_layers, sizeof(int));
     int *kv_cap = (int *)calloc(n_layers, sizeof(int));
+
+    /* Pre-allocate KV cache for full sequence (avoids realloc during inference) */
+    for (int li = 0; li < n_layers; li++) {
+        kv_cap[li] = kv_dim * (max_seq > 64 ? max_seq : 64);
+        kv_k_buf[li] = (float *)calloc(kv_cap[li], sizeof(float));
+        kv_v_buf[li] = (float *)calloc(kv_cap[li], sizeof(float));
+    }
 
     /* Temporary buffer for embedding (1, hidden_dim) */
     float *embed_buf = (float *)malloc(hidden_dim * sizeof(float));
@@ -1468,22 +1476,10 @@ int processor_infer(
             int k_in = kv_in_slots[li * 2]; \
             int v_in = kv_in_slots[li * 2 + 1]; \
             int seq = kv_seq_len[li]; \
-            int sz = num_kv_heads * seq * head_dim; \
-            if (sz > 0) { \
-                tape_slot_write(ctx, k_in, kv_k_buf[li], sz); \
-                int kv_shape[3] = {num_kv_heads, seq, head_dim}; \
-                tape_slot_set_shape(ctx, k_in, kv_shape, 3); \
-                tape_slot_write(ctx, v_in, kv_v_buf[li], sz); \
-                tape_slot_set_shape(ctx, v_in, kv_shape, 3); \
-            } else { \
-                /* Empty cache: write a tiny placeholder */ \
-                float zero = 0.0f; \
-                int kv_shape[3] = {num_kv_heads, 0, head_dim}; \
-                tape_slot_write(ctx, k_in, &zero, 0); \
-                tape_slot_set_shape(ctx, k_in, kv_shape, 3); \
-                tape_slot_write(ctx, v_in, &zero, 0); \
-                tape_slot_set_shape(ctx, v_in, kv_shape, 3); \
-            } \
+            int kv_shape[3] = {num_kv_heads, seq, head_dim}; \
+            /* Point input slots directly at our KV buffers (zero-copy) */ \
+            tape_slot_set_external(ctx, k_in, kv_k_buf[li], kv_shape, 3); \
+            tape_slot_set_external(ctx, v_in, kv_v_buf[li], kv_shape, 3); \
         } \
         /* Run datapath */ \
         tape_run(ctx); \

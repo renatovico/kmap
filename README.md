@@ -81,6 +81,22 @@ One C function call.  Python is only the ctypes bridge.
 - **Dead node elimination**: unreachable nodes are pruned.
 - **Identity elimination**: trivial ops like `add(x, 0)` removed.
 
+### Sub-vector decomposition: why this scales
+
+A naïve truth table for a 32-bit float weight has $2^{32}$ entries — far
+too large to optimise.  The **sub-vector** trick solves this by breaking
+each 32-bit weight into four 8-bit slices:
+
+| Scope | States |
+|---|---|
+| **Per sub-vector** | $2^{8} = 256$ |
+| **Per neuron** (4 slices) | $4 \times 256 = 1{,}024$ |
+| **Global model** (e.g. 7 B params) | Fully parallelisable — every neuron's K-map can be optimised simultaneously on a cluster |
+
+This means the "compilation" (training → circuit) step is tractable for
+billion-parameter models: each neuron's truth table is just 1 K of
+states, and all neurons are independent.
+
 ### FPGA as the target
 
 The optimised DAG exports directly to Verilog/VHDL.  Every node maps

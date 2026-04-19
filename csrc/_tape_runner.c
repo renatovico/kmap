@@ -3,30 +3,22 @@
  *
  * Executes a pre-compiled instruction tape entirely in C,
  * eliminating all Python loop overhead (64K function calls → 1).
- *
- * The tape and slot table are set up once by Python, then
- * ceval_tape_run() is called each decode step with only the
- * INPUT slot data changing.
- *
- * Compile (shared library for Python):
- *   cc -O3 -shared -fPIC -march=native -o csrc/_tape_runner.so \
- *      csrc/_tape_runner.c -lm -framework Accelerate
- *
- * Compile (standalone binary):
- *   cc -O3 -march=native -o kllm_infer \
- *      csrc/kllm_infer.c csrc/_tape_runner.c \
- *      -lm -framework Accelerate
  */
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 #ifdef __APPLE__
 #include <Accelerate/Accelerate.h>
 #else
 #include <cblas.h>
+#endif
+
+#ifdef __ARM_NEON
+#include <arm_neon.h>
 #endif
 
 #include "tape_runner.h"
@@ -479,6 +471,197 @@ static int broadcast_shapes(const int *a, int an, const int *b, int bn,
     return sz;
 }
 
+/* ================================================================
+ * Threaded Truth-Table GEMV
+ *
+ * Parallelizes over K (input rows). Each thread accumulates into
+ * its own private output buffer, then we reduce (sum) across
+ * threads. This avoids any locking in the inner loop.
+ * ================================================================ */
+
+#define TT_NUM_THREADS 8
+#define TT_THREAD_THRESHOLD 128  /* min K per thread to bother */
+
+typedef struct {
+    const float    *x;
+    float          *y_local;  /* thread-private output [N] */
+    const float    *codebook;
+    const uint16_t *w_idx;    /* full index matrix [K*N] */
+    int             n_codes;
+    int             N;
+    int             k_start, k_end;
+} TTThreadArg;
+
+static void *tt_gemv_thread(void *arg) {
+    TTThreadArg *a = (TTThreadArg *)arg;
+    const float    *x        = a->x;
+    float          *y        = a->y_local;
+    const float    *codebook = a->codebook;
+    const uint16_t *w_idx    = a->w_idx;
+    int n_codes = a->n_codes;
+    int N       = a->N;
+    int k_start = a->k_start;
+    int k_end   = a->k_end;
+
+    memset(y, 0, N * sizeof(float));
+
+    /* Thread-local persistent LUT */
+    static __thread float *lut = NULL;
+    static __thread int lut_cap = 0;
+    if (n_codes > lut_cap) {
+        free(lut);
+        lut = (float *)malloc(n_codes * sizeof(float));
+        lut_cap = n_codes;
+    }
+
+    for (int i = k_start; i < k_end; i++) {
+        float xi = x[i];
+#ifdef __ARM_NEON
+        float32x4_t vxi = vdupq_n_f32(xi);
+        int v = 0;
+        for (; v <= n_codes - 4; v += 4) {
+            float32x4_t vc = vld1q_f32(&codebook[v]);
+            vst1q_f32(&lut[v], vmulq_f32(vxi, vc));
+        }
+        for (; v < n_codes; v++)
+            lut[v] = xi * codebook[v];
+#else
+        for (int v = 0; v < n_codes; v++)
+            lut[v] = xi * codebook[v];
+#endif
+        const uint16_t *row = &w_idx[(size_t)i * N];
+        int j = 0;
+        for (; j <= N - 8; j += 8) {
+            y[j+0] += lut[row[j+0]];
+            y[j+1] += lut[row[j+1]];
+            y[j+2] += lut[row[j+2]];
+            y[j+3] += lut[row[j+3]];
+            y[j+4] += lut[row[j+4]];
+            y[j+5] += lut[row[j+5]];
+            y[j+6] += lut[row[j+6]];
+            y[j+7] += lut[row[j+7]];
+        }
+        for (; j < N; j++)
+            y[j] += lut[row[j]];
+    }
+
+    return NULL;
+}
+
+/* Persistent thread pool to avoid pthread_create overhead per op */
+static pthread_t       tp_threads[TT_NUM_THREADS];
+static TTThreadArg     tp_args[TT_NUM_THREADS];
+static pthread_mutex_t tp_mutex[TT_NUM_THREADS];
+static pthread_cond_t  tp_cond_work[TT_NUM_THREADS];
+static pthread_cond_t  tp_cond_done[TT_NUM_THREADS];
+static int             tp_work_ready[TT_NUM_THREADS];
+static int             tp_work_done[TT_NUM_THREADS];
+static int             tp_shutdown = 0;
+static int             tp_initialized = 0;
+
+static void *tp_worker(void *arg) {
+    int tid = (int)(intptr_t)arg;
+    for (;;) {
+        pthread_mutex_lock(&tp_mutex[tid]);
+        while (!tp_work_ready[tid] && !tp_shutdown)
+            pthread_cond_wait(&tp_cond_work[tid], &tp_mutex[tid]);
+        if (tp_shutdown) { pthread_mutex_unlock(&tp_mutex[tid]); return NULL; }
+        tp_work_ready[tid] = 0;
+        pthread_mutex_unlock(&tp_mutex[tid]);
+
+        tt_gemv_thread(&tp_args[tid]);
+
+        pthread_mutex_lock(&tp_mutex[tid]);
+        tp_work_done[tid] = 1;
+        pthread_cond_signal(&tp_cond_done[tid]);
+        pthread_mutex_unlock(&tp_mutex[tid]);
+    }
+}
+
+static void tp_init(void) {
+    if (tp_initialized) return;
+    tp_initialized = 1;
+    for (int t = 0; t < TT_NUM_THREADS; t++) {
+        pthread_mutex_init(&tp_mutex[t], NULL);
+        pthread_cond_init(&tp_cond_work[t], NULL);
+        pthread_cond_init(&tp_cond_done[t], NULL);
+        tp_work_ready[t] = 0;
+        tp_work_done[t] = 0;
+        pthread_create(&tp_threads[t], NULL, tp_worker, (void *)(intptr_t)t);
+    }
+}
+
+static void tt_gemv_mt(const float *x, float *y,
+                       const float *codebook, const uint16_t *w_idx,
+                       int n_codes, int K, int N) {
+    tp_init();
+
+    int n_threads = TT_NUM_THREADS;
+    if (K < TT_THREAD_THRESHOLD * n_threads)
+        n_threads = (K + TT_THREAD_THRESHOLD - 1) / TT_THREAD_THRESHOLD;
+    if (n_threads < 1) n_threads = 1;
+    if (n_threads > TT_NUM_THREADS) n_threads = TT_NUM_THREADS;
+
+    /* Per-thread output buffers (allocated once, grown as needed) */
+    static float *y_bufs[TT_NUM_THREADS];
+    static int y_cap = 0;
+    if (N > y_cap) {
+        for (int t = 0; t < TT_NUM_THREADS; t++) {
+            free(y_bufs[t]);
+            y_bufs[t] = (float *)malloc(N * sizeof(float));
+        }
+        y_cap = N;
+    }
+
+    int chunk = K / n_threads;
+    int rem   = K % n_threads;
+
+    /* Dispatch */
+    int k_off = 0;
+    for (int t = 0; t < n_threads; t++) {
+        int k_len = chunk + (t < rem ? 1 : 0);
+        tp_args[t] = (TTThreadArg){
+            .x = x, .y_local = y_bufs[t],
+            .codebook = codebook, .w_idx = w_idx,
+            .n_codes = n_codes, .N = N,
+            .k_start = k_off, .k_end = k_off + k_len
+        };
+        k_off += k_len;
+
+        pthread_mutex_lock(&tp_mutex[t]);
+        tp_work_done[t] = 0;
+        tp_work_ready[t] = 1;
+        pthread_cond_signal(&tp_cond_work[t]);
+        pthread_mutex_unlock(&tp_mutex[t]);
+    }
+
+    /* Wait */
+    for (int t = 0; t < n_threads; t++) {
+        pthread_mutex_lock(&tp_mutex[t]);
+        while (!tp_work_done[t])
+            pthread_cond_wait(&tp_cond_done[t], &tp_mutex[t]);
+        pthread_mutex_unlock(&tp_mutex[t]);
+    }
+
+    /* Reduce */
+    memcpy(y, y_bufs[0], N * sizeof(float));
+    for (int t = 1; t < n_threads; t++) {
+#ifdef __ARM_NEON
+        int j = 0;
+        for (; j <= N - 4; j += 4) {
+            float32x4_t vy = vld1q_f32(&y[j]);
+            float32x4_t vb = vld1q_f32(&y_bufs[t][j]);
+            vst1q_f32(&y[j], vaddq_f32(vy, vb));
+        }
+        for (; j < N; j++)
+            y[j] += y_bufs[t][j];
+#else
+        for (int j = 0; j < N; j++)
+            y[j] += y_bufs[t][j];
+#endif
+    }
+}
+
 void tape_run(TapeCtx *ctx) {
     Slot *slots = ctx->slots;
     TapeInstr *tape = ctx->tape;
@@ -591,19 +774,7 @@ void tape_run(TapeCtx *ctx) {
         }
 
         case T_MATMUL_TT: {
-            /* Truth-table GEMV: codebook + index matrix, zero multiplies
-             *
-             * Weight slot s1 carries:
-             *   codebook[n_codes]  — unique float32 weight values
-             *   w_indices[K*N]     — uint16 indices into codebook (row-major)
-             *
-             * Algorithm (m==1 decode path):
-             *   For each input position i:
-             *     1) Precompute LUT[v] = x[i] * codebook[v]  (n_codes muls)
-             *     2) Accumulate y[j] += LUT[w_indices[i*N+j]] (N lookups+adds)
-             *   Inner loop is ZERO multiplies — all compute is lookups+adds.
-             *   Weight data is 2x smaller (uint16 vs float32) → less bandwidth.
-             */
+            /* Threaded truth-table GEMV with NEON vectorization */
             int a_ndim = s0->ndim;
             int K = s1->tt_K;
             int N = s1->tt_N;
@@ -632,27 +803,10 @@ void tape_run(TapeCtx *ctx) {
 
             for (int bi = 0; bi < batch; bi++) {
                 float *x = s0->data + bi * a_mat;
-                float *y = out->data + bi * o_mat;
-
+                float *y_out = out->data + bi * o_mat;
                 for (int mi = 0; mi < m; mi++) {
-                    float *xr = x + mi * K;
-                    float *yr = y + mi * N;
-                    memset(yr, 0, N * sizeof(float));
-
-                    /* Temp LUT — fits in L1 cache
-                     * (n_codes ≤ ~6000 → 24 KB) */
-                    float lut[n_codes];
-
-                    for (int i = 0; i < K; i++) {
-                        float xi = xr[i];
-                        /* Precompute: lut[v] = x[i] * codebook[v] */
-                        for (int v = 0; v < n_codes; v++)
-                            lut[v] = xi * codebook[v];
-                        /* Accumulate: y[j] += lut[w_indices[i*N+j]] */
-                        const uint16_t *row = &w_idx[i * N];
-                        for (int j = 0; j < N; j++)
-                            yr[j] += lut[row[j]];
-                    }
+                    tt_gemv_mt(x + mi * K, y_out + mi * N,
+                               codebook, w_idx, n_codes, K, N);
                 }
             }
             break;

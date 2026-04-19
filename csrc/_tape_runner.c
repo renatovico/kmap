@@ -856,40 +856,30 @@ static int utf8_char_len(uint8_t b) {
     return 1; /* invalid — treat as single byte */
 }
 
-/* Pre-tokenize + BPE encode: raw UTF-8 bytes → token IDs.
- *
- * Steps:
- * 1. Prepend space, replace spaces with metaspace ▁
- * 2. Split into words at ▁ boundaries
- * 3. For each word: character → vocab lookup → BPE merge loop
- *
- * Returns number of tokens written to out_ids[].
- */
-int bpe_encode(
+/* Encode a segment of regular text (no special tokens) using BPE.
+ * If prepend_meta is true, prepend metaspace ▁ to the text.
+ * Returns number of tokens written to out_ids[]. */
+static int _bpe_encode_segment(
     const uint8_t *raw_bytes, int raw_len,
-    /* ROMs */
     const uint8_t *hash_keys, const int32_t *hash_vals,
     const int32_t *hash_lens,
     int table_size, int max_piece_len,
     const int32_t *merge_a, const int32_t *merge_b,
     const int32_t *merge_result, int num_merges,
-    int bos_token_id, int max_tokens,
-    /* Output */
+    int max_tokens, int prepend_meta,
     int32_t *out_ids)
 {
-    if (raw_len <= 0) {
-        out_ids[0] = bos_token_id;
-        return 1;
-    }
+    if (raw_len <= 0 || max_tokens <= 0) return 0;
 
     /* Phase 1: build metaspace-transformed buffer.
-     * Prepend space (→ metaspace), then replace all spaces with metaspace. */
+     * Optionally prepend metaspace, then replace all spaces with metaspace. */
     int max_transformed = raw_len * 3 + META_LEN + 16;
     uint8_t *tbuf = (uint8_t *)malloc(max_transformed);
     int tlen = 0;
 
-    /* Prepend metaspace (replaces the prepended space) */
-    tbuf[tlen++] = META_B0; tbuf[tlen++] = META_B1; tbuf[tlen++] = META_B2;
+    if (prepend_meta) {
+        tbuf[tlen++] = META_B0; tbuf[tlen++] = META_B1; tbuf[tlen++] = META_B2;
+    }
 
     for (int i = 0; i < raw_len; i++) {
         if (raw_bytes[i] == ' ') {
@@ -899,31 +889,20 @@ int bpe_encode(
         }
     }
 
-    /* Phase 2: split into words at metaspace boundaries.
-     * Each word starts with ▁. Split BEFORE ▁ when preceded by non-▁.
-     * We process words inline — no need to allocate word array. */
-
+    /* Phase 2: split into words at metaspace boundaries. */
     int n_output = 0;
-    out_ids[n_output++] = bos_token_id;
-
-    /* Temporary word buffer for BPE merge */
     int *word_ids = (int *)malloc((tlen + 1) * sizeof(int));
 
     int wstart = 0;
     while (wstart < tlen) {
-        /* Find end of this word: next ▁ that's preceded by non-▁ */
         int wend = wstart;
 
-        /* Skip initial ▁ */
         if (is_meta(tbuf, wend, tlen))
             wend += META_LEN;
 
-        /* Walk until next ▁ that starts a new word */
         while (wend < tlen) {
-            if (is_meta(tbuf, wend, tlen)) {
-                /* This ▁ starts a new word */
+            if (is_meta(tbuf, wend, tlen))
                 break;
-            }
             int clen = utf8_char_len(tbuf[wend]);
             wend += clen;
         }
@@ -947,7 +926,6 @@ int bpe_encode(
             if (tid >= 0) {
                 word_ids[n_word++] = tid;
             } else {
-                /* Byte-fallback: <0xHH> tokens */
                 for (int b = 0; b < clen; b++) {
                     char hex_str[8];
                     int slen = snprintf(hex_str, sizeof(hex_str),
@@ -964,15 +942,11 @@ int bpe_encode(
 
         /* Phase 4: BPE merge loop */
         while (n_word > 1) {
-            /* Find lowest-rank merge pair */
             int best_rank = num_merges;
             int best_a = -1, best_b = -1, best_result = -1;
 
             for (int i = 0; i < n_word - 1; i++) {
                 int a = word_ids[i], b = word_ids[i + 1];
-                /* Linear scan of merge table (sorted by priority).
-                 * For production, a hash table would be faster — but
-                 * the merge table is O(60K) and this runs once. */
                 for (int r = 0; r < best_rank; r++) {
                     if (merge_a[r] == a && merge_b[r] == b) {
                         best_rank = r;
@@ -984,9 +958,8 @@ int bpe_encode(
                 }
             }
 
-            if (best_a < 0) break; /* no more merges */
+            if (best_a < 0) break;
 
-            /* Merge all occurrences of (best_a, best_b) → best_result */
             int new_n = 0;
             int i = 0;
             while (i < n_word) {
@@ -1002,7 +975,6 @@ int bpe_encode(
             n_word = new_n;
         }
 
-        /* Append word tokens to output */
         for (int i = 0; i < n_word && n_output < max_tokens; i++) {
             out_ids[n_output++] = word_ids[i];
         }
@@ -1012,6 +984,112 @@ int bpe_encode(
 
     free(word_ids);
     free(tbuf);
+    return n_output;
+}
+
+/* Pre-tokenize + BPE encode: raw UTF-8 bytes → token IDs.
+ *
+ * Splits the input at special token boundaries (e.g. </s>) and
+ * encodes each regular text segment with BPE.  Special tokens
+ * are emitted directly by their ID.
+ *
+ * Returns number of tokens written to out_ids[].
+ */
+int bpe_encode(
+    const uint8_t *raw_bytes, int raw_len,
+    /* ROMs */
+    const uint8_t *hash_keys, const int32_t *hash_vals,
+    const int32_t *hash_lens,
+    int table_size, int max_piece_len,
+    const int32_t *merge_a, const int32_t *merge_b,
+    const int32_t *merge_result, int num_merges,
+    int bos_token_id, int max_tokens,
+    /* Special token handling */
+    const uint8_t *id_to_bytes_rom, const int32_t *id_to_offsets,
+    const int32_t *special_ids, int num_special, int vocab_size,
+    /* Output */
+    int32_t *out_ids)
+{
+    int n_output = 0;
+    out_ids[n_output++] = bos_token_id;
+
+    if (raw_len <= 0) return n_output;
+
+    /* Build table of special token byte strings (skip BOS). */
+    const uint8_t **sp_str = NULL;
+    int *sp_len = NULL;
+    int *sp_tok_ids = NULL;
+    int n_sp = 0;
+    if (id_to_bytes_rom && id_to_offsets && special_ids && num_special > 0) {
+        sp_str = (const uint8_t **)malloc(num_special * sizeof(uint8_t *));
+        sp_len = (int *)malloc(num_special * sizeof(int));
+        sp_tok_ids = (int *)malloc(num_special * sizeof(int));
+        for (int s = 0; s < num_special; s++) {
+            int sid = special_ids[s];
+            if (sid == bos_token_id) continue;
+            if (sid < 0 || sid >= vocab_size) continue;
+            int off = id_to_offsets[sid * 2];
+            int slen = id_to_offsets[sid * 2 + 1];
+            if (slen <= 0) continue;
+            sp_str[n_sp] = id_to_bytes_rom + off;
+            sp_len[n_sp] = slen;
+            sp_tok_ids[n_sp] = sid;
+            n_sp++;
+        }
+    }
+
+    int pos = 0;
+    int first_segment = 1;
+
+    while (pos < raw_len && n_output < max_tokens) {
+        /* Try to match a special token at current position */
+        int matched = -1;
+        int matched_len = 0;
+        for (int s = 0; s < n_sp; s++) {
+            int slen = sp_len[s];
+            if (pos + slen > raw_len) continue;
+            if (slen > matched_len &&
+                memcmp(raw_bytes + pos, sp_str[s], slen) == 0) {
+                matched = s;
+                matched_len = slen;
+            }
+        }
+
+        if (matched >= 0) {
+            out_ids[n_output++] = sp_tok_ids[matched];
+            pos += matched_len;
+            first_segment = 0;
+        } else {
+            /* Find extent of regular text until next special token */
+            int seg_end = pos + 1;
+            while (seg_end < raw_len) {
+                int found = 0;
+                for (int s = 0; s < n_sp && !found; s++) {
+                    int slen = sp_len[s];
+                    if (seg_end + slen > raw_len) continue;
+                    if (memcmp(raw_bytes + seg_end, sp_str[s], slen) == 0)
+                        found = 1;
+                }
+                if (found) break;
+                seg_end++;
+            }
+
+            int wrote = _bpe_encode_segment(
+                raw_bytes + pos, seg_end - pos,
+                hash_keys, hash_vals, hash_lens,
+                table_size, max_piece_len,
+                merge_a, merge_b, merge_result, num_merges,
+                max_tokens - n_output, first_segment,
+                out_ids + n_output);
+            n_output += wrote;
+            pos = seg_end;
+            first_segment = 0;
+        }
+    }
+
+    free(sp_str);
+    free(sp_len);
+    free(sp_tok_ids);
     return n_output;
 }
 
@@ -1162,6 +1240,8 @@ int processor_infer_bytes(
         table_size, max_piece_len,
         merge_a, merge_b, merge_result, num_merges,
         bos_token_id, max_seq_tokens,
+        id_to_bytes_rom, id_to_offsets,
+        special_ids, num_special, vocab_size,
         prompt_tokens);
 
     /* --- Phase 2: inference (same logic as processor_infer) --- */
@@ -1268,7 +1348,9 @@ int processor_infer_bytes(
             if (val > best_val) { best_val = val; best_id = v; }
         }
 
-        if (best_id == eos_token_id) break;
+        if (best_id == eos_token_id) {
+            break;
+        }
 
         generated++;
 
